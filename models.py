@@ -36,7 +36,7 @@ class DamageContext:
     raw_damage: int
     damage: int
     skill: Optional["Skill"] = None
-    source_type: str = "skill"  # "skill" | "dot" | "pursuit" | "unbreakable" | custom
+    source_type: str = "skill"  # "skill" | "dot" | "pursuit" | "unbreakable" | "aoe" | custom
     trigger_on_hit_statuses: bool = True
     allow_breath: bool = True
     cancelled: bool = False
@@ -64,7 +64,10 @@ class Skill:
         coins: Optional[List[Coin]] = None,
         target_type: str = "single_enemy",
         clashable: bool = True,
-        unbreakable: bool = False,  # True 表示整个技能为不可摧毁技能
+        unbreakable: bool = False,              # True 表示整个技能为不可摧毁技能
+        is_aoe: Optional[bool] = None,          # True 表示群攻技能（默认按 target_type / clash_aoe / indiscriminate 自动识别）
+        clash_aoe: bool = False,                # True 表示拼点群攻（先与1人拼点，胜出直接释放群攻）
+        indiscriminate: Optional[bool] = None,  # True 表示无差别攻击（同时攻击敌人与队友）
         tags: Optional[Set[str]] = None,
         extra_data: Optional[Dict[str, Any]] = None,
     ):
@@ -76,6 +79,21 @@ class Skill:
         self.target_type = target_type
         self.clashable = clashable
         self.unbreakable = unbreakable
+        self.clash_aoe: bool = bool(clash_aoe)
+        self.indiscriminate: bool = (
+            (target_type == "all_others")
+            if indiscriminate is None
+            else bool(indiscriminate)
+        )
+        self.is_aoe: bool = (
+            (
+                self.clash_aoe
+                or self.indiscriminate
+                or target_type in ("all_enemies", "all_others", "aoe")
+            )
+            if is_aoe is None
+            else bool(is_aoe)
+        )
         self.tags: Set[str] = set(tags) if tags else set()
         self.extra_data: Dict[str, Any] = dict(extra_data) if extra_data else {}
 
@@ -84,18 +102,26 @@ class Skill:
 
     def format_formula(self) -> str:
         if not self.coins:
-            base = f"{self.base_power}"
-            return f"{base}[不可摧毁]" if self.unbreakable else base
+            formula = f"{self.base_power}[不可摧毁]" if self.unbreakable else f"{self.base_power}"
+        else:
+            parts = []
+            for c in self.coins:
+                s = f"+{c.value}" if c.value >= 0 else f"{c.value}"
+                if c.unbreakable and not self.unbreakable:
+                    s += "[固]"
+                parts.append(s)
+            formula = f"{self.base_power}{''.join(parts)}"
+            if self.unbreakable:
+                formula += "[不可摧毁]"
 
-        parts = []
-        for c in self.coins:
-            s = f"+{c.value}" if c.value >= 0 else f"{c.value}"
-            if c.unbreakable and not self.unbreakable:
-                s += "[固]"
-            parts.append(s)
-        formula = f"{self.base_power}{''.join(parts)}"
-        if self.unbreakable:
-            formula += "[不可摧毁]"
+        if self.clash_aoe and self.indiscriminate:
+            formula += "[无差别拼点群攻]"
+        elif self.clash_aoe:
+            formula += "[拼点群攻]"
+        elif self.is_aoe and self.indiscriminate:
+            formula += "[无差别群攻]"
+        elif self.is_aoe:
+            formula += "[群攻]"
         return formula
 
     def clone(self) -> "Skill":
@@ -110,6 +136,9 @@ class Skill:
                 target_type=self.target_type,
                 clashable=self.clashable,
                 unbreakable=self.unbreakable,
+                is_aoe=self.is_aoe,
+                clash_aoe=self.clash_aoe,
+                indiscriminate=self.indiscriminate,
                 tags=set(self.tags),
                 extra_data=dict(self.extra_data),
             )
@@ -156,6 +185,14 @@ class Skill:
         pass
 
     def on_unbreakable_attack_start(self, engine: "CombatEngine", action: "Action") -> None:
+        pass
+
+    def on_aoe_start(self, engine: "CombatEngine", action: "Action") -> None:
+        pass
+
+    def on_aoe_end(
+        self, engine: "CombatEngine", action: "Action", hit_targets: List["Character"]
+    ) -> None:
         pass
 
     def modify_damage(
