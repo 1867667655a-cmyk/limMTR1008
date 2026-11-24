@@ -16,7 +16,7 @@ class Coin:
     value: int
     probability: float = 0.5
     label: str = ""
-    # 可选动态条件/触发回调: fn(engine, skill, actor, triggered: bool)
+    unbreakable: bool = False  # 是否为不可摧毁变动值
     on_roll: Optional[Callable[..., None]] = None
 
     def clone(self) -> "Coin":
@@ -24,6 +24,7 @@ class Coin:
             value=self.value,
             probability=self.probability,
             label=self.label,
+            unbreakable=self.unbreakable,
             on_roll=self.on_roll,
         )
 
@@ -35,8 +36,8 @@ class DamageContext:
     raw_damage: int
     damage: int
     skill: Optional["Skill"] = None
-    source_type: str = "skill"  # "skill" | "dot" | "pursuit" | "effect" | custom
-    trigger_on_hit_statuses: bool = True  # False 用于防止 DoT 触发破裂/腐蚀死循环
+    source_type: str = "skill"  # "skill" | "dot" | "pursuit" | "unbreakable" | custom
+    trigger_on_hit_statuses: bool = True
     allow_breath: bool = True
     cancelled: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -45,7 +46,6 @@ class DamageContext:
         self.damage = floor_val(self.damage + amount)
 
     def mul_percent(self, percent: int) -> None:
-        """例如 percent=120 表示乘以 1.2 倍并向下取整"""
         self.damage = floor_mul(self.damage, percent, 100)
 
     def mul_ratio(self, numerator: int, denominator: int) -> None:
@@ -53,19 +53,18 @@ class DamageContext:
 
 
 class Skill:
-    """
-    技能基类：既可以直接实例化使用，也可以在角色卡里继承并重写任意方法。
-    """
+    """技能基类"""
 
     def __init__(
         self,
         skill_id: str,
         name: str,
-        tier: Any = 1,  # 通常是 1 / 2 / 3，也兼容任意自定义标识（如 "EX", 4）
+        tier: Any = 1,
         base_power: int = 0,
         coins: Optional[List[Coin]] = None,
-        target_type: str = "single_enemy",  # single_enemy | all_enemies | self | single_ally | custom
+        target_type: str = "single_enemy",
         clashable: bool = True,
+        unbreakable: bool = False,  # True 表示整个技能为不可摧毁技能
         tags: Optional[Set[str]] = None,
         extra_data: Optional[Dict[str, Any]] = None,
     ):
@@ -76,19 +75,30 @@ class Skill:
         self.coins: List[Coin] = coins if coins is not None else []
         self.target_type = target_type
         self.clashable = clashable
+        self.unbreakable = unbreakable
         self.tags: Set[str] = set(tags) if tags else set()
         self.extra_data: Dict[str, Any] = dict(extra_data) if extra_data else {}
 
+    def has_unbreakable(self) -> bool:
+        return self.unbreakable or any(c.unbreakable for c in self.coins)
+
     def format_formula(self) -> str:
         if not self.coins:
-            return f"{self.base_power}"
-        coins_str = "".join(
-            f"+{c.value}" if c.value >= 0 else f"{c.value}" for c in self.coins
-        )
-        return f"{self.base_power}{coins_str}"
+            base = f"{self.base_power}"
+            return f"{base}[不可摧毁]" if self.unbreakable else base
+
+        parts = []
+        for c in self.coins:
+            s = f"+{c.value}" if c.value >= 0 else f"{c.value}"
+            if c.unbreakable and not self.unbreakable:
+                s += "[固]"
+            parts.append(s)
+        formula = f"{self.base_power}{''.join(parts)}"
+        if self.unbreakable:
+            formula += "[不可摧毁]"
+        return formula
 
     def clone(self) -> "Skill":
-        # 如果角色卡继承了 Skill 并自定义了 __init__，优先尝试调用子类提供的 clone_custom 或回退
         cls = self.__class__
         if cls is Skill:
             return Skill(
@@ -99,6 +109,7 @@ class Skill:
                 coins=[c.clone() for c in self.coins],
                 target_type=self.target_type,
                 clashable=self.clashable,
+                unbreakable=self.unbreakable,
                 tags=set(self.tags),
                 extra_data=dict(self.extra_data),
             )
@@ -109,7 +120,7 @@ class Skill:
         obj.extra_data = dict(self.extra_data)
         return obj
 
-    # ---- 以下钩子均可在自定义 Skill 子类中按需重写 ----
+    # ---- 钩子方法 ----
     def can_use(self, engine: "CombatEngine", actor: "Character") -> bool:
         return True
 
@@ -141,27 +152,23 @@ class Skill:
     ) -> None:
         pass
 
-    def on_unopposed_start(
-        self, engine: "CombatEngine", action: "Action"
-    ) -> None:
+    def on_unopposed_start(self, engine: "CombatEngine", action: "Action") -> None:
+        pass
+
+    def on_unbreakable_attack_start(self, engine: "CombatEngine", action: "Action") -> None:
         pass
 
     def modify_damage(
         self, engine: "CombatEngine", action: "Action", dmg_ctx: DamageContext
     ) -> None:
-        """用于技能自身的独立倍率、固定伤或特殊伤害公式"""
         pass
 
     def on_hit(
         self, engine: "CombatEngine", action: "Action", target: "Character", dmg_ctx: DamageContext
     ) -> None:
-        """命中并造成伤害后触发（如施加烧伤、震颤引爆、触发追击等）"""
         pass
 
-    def on_attack_end(
-        self, engine: "CombatEngine", action: "Action"
-    ) -> None:
-        """攻击结算完全结束后触发（即使目标死亡或伤害为0）"""
+    def on_attack_end(self, engine: "CombatEngine", action: "Action") -> None:
         pass
 
     def __repr__(self) -> str:
@@ -171,21 +178,18 @@ class Skill:
 @dataclass
 class Action:
     actor: "Character"
-    skill: Optional[Skill]  # None 表示空过/无技能挨打
+    skill: Optional[Skill]
     targets: List["Character"] = field(default_factory=list)
     consume_from_hand: bool = True
-    is_pursuit: bool = False  # 是否属于追击
+    is_pursuit: bool = False
+    is_unbreakable_attack: bool = False
     clashable: bool = True
     cancelled: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
 
 class Passive:
-    """
-    角色被动/特性基类：
-    1) 条件型被动可重写 is_active(engine, owner) -> bool（如血量低于10%常驻生效）
-    2) 事件型被动在触发时调用 self.notify_triggered(engine) 即可统一显示与记录
-    """
+    """角色被动/特性基类"""
 
     def __init__(self, name: str, description: str = ""):
         self.name = name
@@ -214,15 +218,9 @@ class Passive:
         self.owner = None
 
     def is_active(self, engine: "CombatEngine", owner: "Character") -> bool:
-        """条件型被动可重写此方法，返回当前条件是否满足"""
         return False
 
     def is_triggered(self, engine: "CombatEngine", owner: "Character") -> bool:
-        """
-        判断当前画面是否应显示此被动处于触发状态：
-        - 若重写了 is_active，则实时按条件判断（如回血超过10%后自动熄灭）
-        - 否则按本回合是否调用过 notify_triggered 判断
-        """
         if type(self).is_active is not Passive.is_active:
             return self.is_active(engine, owner)
         return self.last_triggered_turn == engine.global_turn
@@ -233,7 +231,6 @@ class Passive:
         detail: str = "",
         log: bool = True,
     ) -> None:
-        """标记被动已触发，并输出统一格式提示"""
         self.last_triggered_turn = engine.global_turn
         self.last_triggered_round = engine.round_num
         engine.events.emit(
@@ -248,8 +245,9 @@ class Passive:
             suffix = f"（{detail}）" if detail else ""
             engine.log(f"  {owner_prefix}当前触发被动：{self.name}{suffix}")
 
+
 class StatusEffect:
-    """状态效果基类：支持内置 7 种 DoT 以及角色卡任意自创 Buff/Debuff"""
+    """状态效果基类"""
 
     def __init__(
         self,
@@ -264,6 +262,14 @@ class StatusEffect:
         self.data: Dict[str, Any] = dict(data) if data else {}
         self.owner: Optional["Character"] = None
         self._listener_ids: List[int] = []
+
+    @property
+    def is_buff(self) -> bool:
+        return self.category == "buff"
+
+    @property
+    def is_debuff(self) -> bool:
+        return self.category == "debuff"
 
     def bind(
         self,
@@ -285,18 +291,10 @@ class StatusEffect:
         engine.events.unsubscribe_by_owner(self)
         self._listener_ids.clear()
         self.owner = None
-    @property
-    def is_buff(self) -> bool:
-        return self.category == "buff"
 
-    @property
-    def is_debuff(self) -> bool:
-        return self.category == "debuff"
 
 class Character:
-    """
-    角色实体：所有属性、技能组成、被动、行动槽数量、选人策略均可自定义。
-    """
+    """角色实体"""
 
     def __init__(
         self,
@@ -318,7 +316,6 @@ class Character:
         self.hp = floor_val(hp) if hp is not None else self.max_hp
         self.alive: bool = self.hp > 0
 
-        # 技能模板: [(Skill原型, 每轮分发数量), ...], 默认兼容 1个三技能 + 2个二技能 + 3个一技能
         self.skill_template: List[Tuple[Skill, int]] = skill_template or []
         self.available_skills: List[Skill] = []
 
@@ -326,18 +323,14 @@ class Character:
         self.statuses: Dict[str, StatusEffect] = {}
         self.action_slots: int = action_slots
         self.custom_state: Dict[str, Any] = dict(custom_state) if custom_state else {}
-
-        # 可由角色卡注入自定义 AI / 选择器函数:
-        # fn(engine, character, slot_idx, previous_selections) -> Action
-        self.ai_selector: Optional[Callable[..., Action]] = None
         self.bgm_tracks: List[Any] = list(bgm_tracks) if bgm_tracks else []
 
+        self.ai_selector: Optional[Callable[..., Action]] = None
+
     def set_standard_skills(self, skill1: Skill, skill2: Skill, skill3: Skill) -> None:
-        """快捷设置标准 3-2-1 技能组"""
         self.skill_template = [(skill3, 1), (skill2, 2), (skill1, 3)]
 
     def refill_skills(self) -> List[Skill]:
-        """按模板生成新一轮技能"""
         new_skills: List[Skill] = []
         for proto, count in self.skill_template:
             for _ in range(count):
@@ -355,16 +348,18 @@ class Character:
         st = self.statuses.get(name)
         return st.stacks if st else 0
 
-    def __repr__(self) -> str:
-        return f"<Char {self.name}[{self.team}] HP:{self.hp}/{self.max_hp}>"
+    def get_buffs(self) -> List[StatusEffect]:
+        return [s for s in self.statuses.values() if s.is_buff]
+
+    def get_debuffs(self) -> List[StatusEffect]:
+        return [s for s in self.statuses.values() if s.is_debuff]
+
     def get_triggered_passives(self, engine: "CombatEngine") -> List[Passive]:
         return [p for p in self.passives if p.is_triggered(engine, self)]
 
     def format_triggered_passives(self, engine: "CombatEngine") -> str:
         triggered = self.get_triggered_passives(engine)
         return "、".join(p.name for p in triggered)
-    def get_buffs(self) -> List[StatusEffect]:
-        return [s for s in self.statuses.values() if s.is_buff]
 
-    def get_debuffs(self) -> List[StatusEffect]:
-        return [s for s in self.statuses.values() if s.is_debuff]
+    def __repr__(self) -> str:
+        return f"<Char {self.name}[{self.team}] HP:{self.hp}/{self.max_hp}>"
