@@ -5,3 +5,9 @@ f"  [破裂] {self.owner.name} 触发破裂造成 {dmg} 点伤害（层数减半
 AttributeError: 'NoneType' object has no attribute 'name'
 
 engine/statuses.py修复
+
+
+2026/11/24 20:27
+更新不可摧毁硬币engine/combat.py、engine/models.py、engine/events.py
+可给技能硬币额外定义“unbreakable=True”以调用，例：
+coins=[Coin(3), Coin(3), Coin(3, unbreakable=True)]
