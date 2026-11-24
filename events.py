@@ -28,6 +28,17 @@ class EventType(Enum):
     CLASH_LOSE = auto()
     UNOPPOSED_ATTACK_START = auto()
 
+    # 群攻阶段（非拼点群攻与竞争）
+    AOE_CONTEST_START = auto()   # 多方非拼点群攻抢先掷骰开始
+    AOE_CONTEST_ROLL = auto()    # 多方非拼点群攻各自掷骰结果
+    AOE_CONTEST_WIN = auto()     # 点数最大者获得释放权
+    AOE_CONTEST_LOSE = auto()    # 点数不足者群攻被取消
+
+    AOE_START = auto()           # 群攻开始（自身掷骰前）
+    AOE_TARGET_ROLL = auto()     # 其他玩家掷出对抗点数后（可修改 target_roll）
+    AOE_SUPPRESS = auto()        # 玩家点数小于群攻，技能本回合被禁用
+    AOE_END = auto()             # 群攻结算结束
+
     # 不可摧毁技能/变动值阶段
     BEFORE_UNBREAKABLE_RESOLVE = auto()  # 可用于强行摧毁不可摧毁技能、修改保底点数等
     UNBREAKABLE_ATTACK_START = auto()
