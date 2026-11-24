@@ -7,8 +7,8 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 from .bgm import AudioBackend, BGMManager
 from .events import EventBus, EventType
 from .math_utils import floor_val
-from .models import Action, Character, DamageContext, Skill, StatusEffect
-from .statuses import STATUS_CATEGORIES, STATUS_REGISTRY, register_default_statuses
+from .models import Action, Character, Coin, DamageContext, Skill, StatusEffect
+from .statuses import STATUS_REGISTRY, register_default_statuses
 
 
 class CombatEngine:
@@ -38,19 +38,17 @@ class CombatEngine:
         self.roll_handler: Optional[Any] = roll_handler
         self.show_turn_board: bool = show_turn_board
         self.bgm = BGMManager(self, audio_backend=audio_backend)
-        self._evaluating_bgm: bool = False
 
         self.round_num: int = 0
         self.turn_in_round: int = 0
         self.global_turn: int = 0
-        self._tie_turn_starter: str = "P1"  # 同血量时先手队伍：P1先手，然后轮流
+        self._tie_turn_starter: str = "P1"
 
         self.action_queue: Deque[Action] = deque()
         self.current_turn_selections: List[Action] = []
         self.game_over: bool = False
         self.winner_team: Optional[str] = None
 
-        # 外部交互回调，如果角色无 ai_selector 且提供了此回调，则交由外部（如CLI）选择
         self.manual_selector: Optional[
             Callable[["CombatEngine", Character, int, List[Action]], Action]
         ] = None
@@ -64,7 +62,6 @@ class CombatEngine:
             self.logger(msg)
 
     def toggle_auto_roll(self, enabled: Optional[bool] = None) -> bool:
-        """随时随地开启/关闭自动投掷"""
         self.auto_roll = (not self.auto_roll) if enabled is None else bool(enabled)
         self.events.emit(EventType.AUTO_ROLL_TOGGLED, self, auto_roll=self.auto_roll)
         return self.auto_roll
@@ -75,16 +72,6 @@ class CombatEngine:
             p.on_register(self, char)
         for tr in getattr(char, "bgm_tracks", []):
             self.bgm.register_track(tr, owner=char)
-
-    def _evaluate_bgm(self, reason: str = "") -> None:
-        """带重入保护的 BGM 评估，防止 BGM_CHANGED 回调触发死循环"""
-        if self._evaluating_bgm or self.game_over:
-            return
-        self._evaluating_bgm = True
-        try:
-            self.bgm.evaluate(reason=reason)
-        finally:
-            self._evaluating_bgm = False
 
     # ------------------------------------------------------------------
     # 查询辅助
@@ -126,7 +113,7 @@ class CombatEngine:
         return None
 
     # ------------------------------------------------------------------
-    # 状态管理（兼容注册表、分类表与任意自定义 StatusEffect 实例）
+    # 状态管理
     # ------------------------------------------------------------------
     def apply_status(
         self,
@@ -174,7 +161,7 @@ class CombatEngine:
             if existing.stacks <= 0:
                 self.remove_status(target, name)
                 return None
-            self._evaluate_bgm(f"状态叠加:{name}")
+            self.bgm.evaluate(reason=f"状态变化:{name}")
             return existing
 
         if stacks <= 0:
@@ -183,8 +170,8 @@ class CombatEngine:
         if new_obj is None:
             cls = STATUS_REGISTRY.get(name)
             if cls is None:
-                cat = extra.get("category", STATUS_CATEGORIES.get(name, "neutral"))
-                new_obj = StatusEffect(name=name, stacks=stacks, category=cat)
+                category = extra.get("category", "neutral")
+                new_obj = StatusEffect(name=name, stacks=stacks, category=category)
             else:
                 new_obj = cls(stacks=stacks)
         else:
@@ -192,7 +179,7 @@ class CombatEngine:
 
         target.statuses[name] = new_obj
         new_obj.on_attach(self, target)
-        self._evaluate_bgm(f"状态施加:{name}")
+        self.bgm.evaluate(reason=f"获得状态:{name}")
         return new_obj
 
     def set_status_stacks(self, target: Character, name: str, new_stacks: int) -> None:
@@ -204,7 +191,6 @@ class CombatEngine:
             self.remove_status(target, name)
         else:
             st.stacks = new_stacks
-            self._evaluate_bgm(f"状态变化:{name}")
 
     def consume_status(self, target: Character, name: str, amount: int) -> bool:
         amount = floor_val(amount)
@@ -219,7 +205,7 @@ class CombatEngine:
         if st:
             self.events.emit(EventType.STATUS_REMOVE, self, target=target, status=st)
             st.on_detach(self)
-            self._evaluate_bgm(f"状态移除:{name}")
+            self.bgm.evaluate(reason=f"移除状态:{name}")
 
     # ------------------------------------------------------------------
     # 掷骰与伤害管线
@@ -327,11 +313,9 @@ class CombatEngine:
             allow_breath=allow_breath,
         )
 
-        # 技能自身先调整（如自带倍率、基础伤害重写等）
         if skill and action:
             skill.modify_damage(self, action, dmg_ctx)
 
-        # 全局/被动/伤害提升/呼吸等事件介入计算最终伤害
         self.events.emit(
             EventType.CALCULATE_DAMAGE,
             self,
@@ -341,7 +325,6 @@ class CombatEngine:
         if dmg_ctx.cancelled:
             return 0
 
-        # 受击前调整（如守护减伤、护盾、免伤）
         self.events.emit(
             EventType.BEFORE_TAKE_DAMAGE,
             self,
@@ -363,7 +346,6 @@ class CombatEngine:
             f"(HP: {target.hp}/{target.max_hp})"
         )
 
-        # 受击后触发（破裂、腐蚀等；由 DoT 引起的伤害标记 trigger_on_hit_statuses=False 防止死循环）
         self.events.emit(
             EventType.AFTER_TAKE_DAMAGE,
             self,
@@ -376,7 +358,7 @@ class CombatEngine:
             skill.on_hit(self, action, target, dmg_ctx)
 
         self._check_death(target, killer=attacker, damage_context=dmg_ctx)
-        self._evaluate_bgm("生命值变动")
+        self.bgm.evaluate(reason="生命值变化")
         return actual_loss
 
     def _check_death(
@@ -401,7 +383,6 @@ class CombatEngine:
     # 追击与外部动作插入
     # ------------------------------------------------------------------
     def enqueue_action(self, action: Action, front: bool = False) -> None:
-        """供角色卡实现追击（front=True 立即插队执行）或额外攻击"""
         if front:
             self.action_queue.appendleft(action)
         else:
@@ -411,11 +392,6 @@ class CombatEngine:
     # 选技顺序逻辑
     # ------------------------------------------------------------------
     def compute_selection_order(self) -> List[Tuple[Character, int]]:
-        """
-        返回本回合的 (角色, 行动槽序号) 选择顺序：
-        - 血量高者先选；
-        - 血量完全相等时：以 _tie_turn_starter (首回合为P1) 先手，并在同血量间轮流交替。
-        """
         living = self.get_living_characters()
         all_slots: List[Tuple[Character, int]] = []
         for c in living:
@@ -474,16 +450,19 @@ class CombatEngine:
     # 主流程控制
     # ------------------------------------------------------------------
     def _log_turn_board(self) -> None:
+        self.log("[场上状态]")
         if self.bgm.current_track:
             tr = self.bgm.current_track
             prog = self.bgm._sync_current_progress()
             owner_name = tr.owner.name if tr.owner else "场地"
-            self.log(f"[当前BGM] {owner_name} - 《{tr.title}》(单曲循环 | 进度: {prog:.2f}s)")
-
-        self.log("[场上状态]")
+            self.log(f"  [当前BGM] {owner_name} - 《{tr.title}》(单曲循环 | 进度: {prog:.2f}s)")
         for c in self.get_living_characters():
             st_str = (
-                " | 状态: " + ", ".join(f"{k}:{v.stacks}" for k, v in c.statuses.items())
+                " | 状态: "
+                + ", ".join(
+                    f"{k}({'益' if v.is_buff else '减' if v.is_debuff else '中'}):{v.stacks}"
+                    for k, v in c.statuses.items()
+                )
                 if c.statuses
                 else ""
             )
@@ -491,19 +470,14 @@ class CombatEngine:
                 f"  [{c.team}] {c.name} HP:{c.hp}/{c.max_hp} "
                 f"(余牌:{len(c.available_skills)}){st_str}"
             )
-            if hasattr(c, "format_triggered_passives"):
-                p_str = c.format_triggered_passives(self)
-            else:
-                p_str = "、".join(
-                    p.name for p in c.passives if hasattr(p, "is_triggered") and p.is_triggered(self, c)
-                )
+            p_str = c.format_triggered_passives(self)
             if p_str:
                 self.log(f"    当前触发被动：{p_str}")
 
     def run_game(self) -> Optional[str]:
         self.log("=== 战斗开始 ===")
         self.events.emit(EventType.GAME_START, self)
-        self._evaluate_bgm("战斗开始")
+        self.bgm.evaluate(reason="战斗开始")
 
         while not self.game_over and self.round_num < self.max_rounds:
             self.round_num += 1
@@ -518,7 +492,6 @@ class CombatEngine:
     def run_round(self) -> None:
         self.log(f"\n================ 第 {self.round_num} 轮 ================")
 
-        # 仅当某角色上一轮用光了所有技能（available_skills 为空），才在新一轮开始时补充
         for c in self.get_living_characters():
             if len(c.available_skills) == 0:
                 ctx = self.events.emit(
@@ -536,7 +509,6 @@ class CombatEngine:
                 )
 
         self.events.emit(EventType.ROUND_START, self, round_num=self.round_num)
-        self._evaluate_bgm("轮次开始")
 
         for t in range(1, self.turns_per_round + 1):
             if self.check_victory():
@@ -556,13 +528,11 @@ class CombatEngine:
             turn_in_round=self.turn_in_round,
             global_turn=self.global_turn,
         )
-        # 在打印面板与选技前刷新 BGM（上一回合新触发的 BGM 在此失去“首回合最高优先级”）
-        self._evaluate_bgm("回合开始")
+        self.bgm.evaluate(reason="回合开始")
 
         if self.show_turn_board:
             self._log_turn_board()
 
-        # 1. 决定选择顺序并依次选技（后选方可通过 previous_selections 看到先选方选择）
         order = self.compute_selection_order()
         self.current_turn_selections = []
 
@@ -598,7 +568,6 @@ class CombatEngine:
                 action=action,
                 all_selections=self.current_turn_selections,
             )
-            self._evaluate_bgm("选技后")
 
             if action.skill:
                 tgt_names = ",".join(t.name for t in action.targets)
@@ -608,7 +577,6 @@ class CombatEngine:
             else:
                 self.log(f"[选技] {char.name} 无可用技能（本回合只能挨打）")
 
-        # 轮流切换下回合的同血量先手方
         teams = self.get_teams_alive()
         if len(teams) >= 2:
             if self._tie_turn_starter in teams:
@@ -617,25 +585,21 @@ class CombatEngine:
             else:
                 self._tie_turn_starter = teams[0]
 
-        # 2. 匹配拼点 / 单方面攻击，允许被动在此修改匹配结果
         planned = [a for a in self.current_turn_selections if not a.cancelled and a.skill is not None]
         self.events.emit(EventType.RESOLVE_MATCHUPS, self, actions=planned)
 
         clashes, unopposed = self._pair_actions(planned)
 
-        # 执行拼点
         for act1, act2 in clashes:
             if self.check_victory():
                 break
             self._resolve_clash(act1, act2)
             self._drain_pursuit_queue()
 
-        # 执行剩余单方面行动及所有追击
         for act in unopposed:
             self.action_queue.append(act)
         self._drain_pursuit_queue()
 
-        # 3. 回合结束阶段（结算 Burn/Tremor/Bleed/Corrosion 衰减以及每回合清零Buff等）
         if not self.check_victory():
             self.events.emit(
                 EventType.TURN_END,
@@ -644,16 +608,11 @@ class CombatEngine:
                 turn_in_round=self.turn_in_round,
             )
         self._drain_pursuit_queue()
-        self._evaluate_bgm("回合结束")
+        self.bgm.evaluate(reason="回合结束")
 
     def _pair_actions(
         self, actions: List[Action]
     ) -> Tuple[List[Tuple[Action, Action]], List[Action]]:
-        """
-        多对多匹配规则：
-        如果 A 选择对拼敌方 B（且在 B 的目标里），而 B 也选择了 A（且均未配对、可拼点），则配对拼点；
-        其余未配对的技能按顺序作为单方面行动执行。
-        """
         used = set()
         clashes: List[Tuple[Action, Action]] = []
         unopposed: List[Action] = []
@@ -689,6 +648,76 @@ class CombatEngine:
             if act.cancelled or not act.actor.alive or act.skill is None:
                 continue
             self._resolve_unopposed(act)
+
+    # ------------------------------------------------------------------
+    # 拼点与不可摧毁结算
+    # ------------------------------------------------------------------
+    def _build_unbreakable_action(
+        self, winner_act: Action, loser_act: Action
+    ) -> Optional[Action]:
+        """评估拼点失败方是否保留不可摧毁技能/变动值，并兼容外部强行摧毁等钩子"""
+        assert loser_act.skill is not None
+        skill = loser_act.skill
+
+        # 快捷标记兼容（比如胜者 on_clash_win 里写 opp_action.extra["destroy_unbreakable"] = True）
+        force_destroy = bool(loser_act.extra.get("destroy_unbreakable", False))
+        force_unbreakable = bool(loser_act.extra.get("force_unbreakable", False))
+
+        if force_destroy:
+            surviving_coins: List[Coin] = []
+            broken_coins: List[Coin] = [c.clone() for c in skill.coins]
+            survives = False
+        elif force_unbreakable or skill.unbreakable:
+            surviving_coins = [c.clone() for c in skill.coins]
+            broken_coins = []
+            survives = True
+        else:
+            surviving_coins = [c.clone() for c in skill.coins if c.unbreakable]
+            broken_coins = [c.clone() for c in skill.coins if not c.unbreakable]
+            survives = len(surviving_coins) > 0
+
+        ctx = self.events.emit(
+            EventType.BEFORE_UNBREAKABLE_RESOLVE,
+            self,
+            winner_action=winner_act,
+            loser_action=loser_act,
+            surviving_coins=surviving_coins,
+            broken_coins=broken_coins,
+            survives=survives,
+            forced_coin_value=1,
+        )
+
+        if ctx.cancelled or not ctx.data["survives"]:
+            return None
+
+        final_coins: List[Coin] = ctx.data["surviving_coins"]
+        forced_val = floor_val(ctx.data["forced_coin_value"])
+
+        # 若既不是0硬币不可摧毁技能，也没有任何存活硬币，则视为彻底摧毁
+        if not final_coins and not (skill.unbreakable or force_unbreakable):
+            return None
+
+        new_skill = skill.clone()
+        new_skill.coins = []
+        for c in final_coins:
+            nc = c.clone()
+            nc.value = forced_val  # 不可摧毁变动值强制变为 +1（额外变动值加成仍会在 roll_skill 中叠加）
+            new_skill.coins.append(nc)
+
+        return Action(
+            actor=loser_act.actor,
+            skill=new_skill,
+            targets=list(loser_act.targets),
+            consume_from_hand=False,
+            is_pursuit=False,
+            is_unbreakable_attack=True,
+            clashable=False,
+            extra={
+                "after_clash_lose": True,
+                "broken_coins_count": len(ctx.data["broken_coins"]),
+                "clash_winner": winner_act.actor,
+            },
+        )
 
     def _resolve_clash(self, act1: Action, act2: Action) -> None:
         if not act1.actor.alive or not act2.actor.alive:
@@ -746,24 +775,43 @@ class CombatEngine:
                     self.events.emit(EventType.CLASH_CANCEL_99, self, action1=act1, action2=act2)
                     return
 
-        self.log(
-            f"  [拼点结果] {winner_act.actor.name}({win_roll}) 胜出！ "
-            f"{loser_act.actor.name}({lose_roll}) 技能被摧毁"
-        )
-
-        # 败者技能摧毁
+        # 败者与胜者拼点结果回调
         loser_act.skill.on_clash_lose(self, loser_act, winner_act, lose_roll)
-        self.events.emit(
-            EventType.CLASH_LOSE,
-            self,
-            winner_action=winner_act,
-            loser_action=loser_act,
-            roll=lose_roll,
-        )
-        self.events.emit(EventType.SKILL_DESTROYED, self, action=loser_act)
-
-        # 胜者结算攻击
         winner_act.skill.on_clash_win(self, winner_act, loser_act, win_roll)
+
+        unbreakable_act = self._build_unbreakable_action(winner_act, loser_act)
+        destroyed = unbreakable_act is None
+
+        if destroyed:
+            self.log(
+                f"  [拼点结果] {winner_act.actor.name}({win_roll}) 胜出！ "
+                f"{loser_act.actor.name}({lose_roll}) 技能被摧毁"
+            )
+            self.events.emit(
+                EventType.CLASH_LOSE,
+                self,
+                winner_action=winner_act,
+                loser_action=loser_act,
+                roll=lose_roll,
+                destroyed=True,
+            )
+            self.events.emit(EventType.SKILL_DESTROYED, self, action=loser_act)
+        else:
+            assert unbreakable_act.skill is not None
+            self.log(
+                f"  [拼点结果] {winner_act.actor.name}({win_roll}) 胜出！ "
+                f"{loser_act.actor.name}({lose_roll}) 触发【不可摧毁】，保留为 [{unbreakable_act.skill.format_formula()}]"
+            )
+            self.events.emit(
+                EventType.CLASH_LOSE,
+                self,
+                winner_action=winner_act,
+                loser_action=loser_act,
+                roll=lose_roll,
+                destroyed=False,
+                unbreakable_action=unbreakable_act,
+            )
+
         self.events.emit(
             EventType.CLASH_WIN,
             self,
@@ -772,7 +820,28 @@ class CombatEngine:
             roll=win_roll,
         )
 
+        # 1) 胜者攻击结算
         self._execute_skill_hits(winner_act, win_roll)
+
+        # 2) 若败者仍存活且保留了不可摧毁技能，则进行不可摧毁反击
+        if unbreakable_act is not None and unbreakable_act.actor.alive and not self.check_victory():
+            self._resolve_unbreakable_attack(unbreakable_act)
+
+    def _resolve_unbreakable_attack(self, act: Action) -> None:
+        if not act.actor.alive or act.skill is None:
+            return
+        tgt_names = ",".join(t.name for t in act.targets if t.alive)
+        if not tgt_names and act.skill.target_type != "self":
+            return
+        self.log(
+            f"[不可摧毁攻击] {act.actor.name}[{act.skill.name}({act.skill.format_formula()})] -> {tgt_names or act.actor.name}"
+        )
+        act.skill.on_unbreakable_attack_start(self, act)
+        self.events.emit(EventType.UNBREAKABLE_ATTACK_START, self, action=act)
+        roll_val = self.roll_skill(act)
+        if not self.roll_handler:
+            self.log(f"  [掷骰] {act.actor.name} 不可摧毁攻击掷出 {roll_val} 点")
+        self._execute_skill_hits(act, roll_val, source_type="unbreakable")
 
     def _resolve_unopposed(self, act: Action) -> None:
         if not act.actor.alive or act.skill is None:
@@ -787,9 +856,13 @@ class CombatEngine:
         roll_val = self.roll_skill(act)
         if not self.roll_handler:
             self.log(f"  [掷骰] {act.actor.name} 掷出 {roll_val} 点")
-        self._execute_skill_hits(act, roll_val)
+        self._execute_skill_hits(
+            act, roll_val, source_type="pursuit" if act.is_pursuit else "skill"
+        )
 
-    def _execute_skill_hits(self, act: Action, roll_val: int) -> None:
+    def _execute_skill_hits(
+        self, act: Action, roll_val: int, source_type: str = "skill"
+    ) -> None:
         assert act.skill is not None
         targets = [t for t in act.targets if t.alive]
         if not targets and act.skill.target_type == "self" and act.actor.alive:
@@ -806,7 +879,7 @@ class CombatEngine:
                 raw_damage=roll_val,
                 skill=act.skill,
                 action=act,
-                source_type="pursuit" if act.is_pursuit else "skill",
+                source_type=source_type,
                 trigger_on_hit_statuses=True,
                 allow_breath=True,
             )
