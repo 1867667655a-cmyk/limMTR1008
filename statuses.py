@@ -187,7 +187,8 @@ class RuptureStatus(StatusEffect):
 
     def _on_take_damage(self, ctx: EventContext) -> None:
         dmg_ctx: DamageContext = ctx.data["damage_context"]
-        if dmg_ctx.target is not self.owner or not self.owner.alive or self.stacks <= 0:
+        owner = self.owner
+        if dmg_ctx.target is not owner or owner is None or not owner.alive or self.stacks <= 0:
             return
         if not dmg_ctx.trigger_on_hit_statuses:
             return
@@ -195,13 +196,13 @@ class RuptureStatus(StatusEffect):
         dmg = self.stacks
         new_stacks = _halve(self.stacks)
         engine: "CombatEngine" = ctx.engine
-        engine.set_status_stacks(self.owner, self.name, new_stacks)
+        engine.set_status_stacks(owner, self.name, new_stacks)
         engine.log(
-            f"  [破裂] {self.owner.name} 触发破裂造成 {dmg} 点伤害（层数减半为 {new_stacks}）"
+            f"  [破裂] {owner.name} 触发破裂造成 {dmg} 点伤害（层数减半为 {new_stacks}）"
         )
         engine.apply_damage(
             attacker=None,
-            target=self.owner,
+            target=owner,
             raw_damage=dmg,
             source_type="dot_rupture",
             trigger_on_hit_statuses=False,
