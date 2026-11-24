@@ -7,3 +7,6 @@ limMTR
 普通敌方群攻：target_type="all_enemies"
 无差别群攻：target_type="all_others"（或 indiscriminate=True）
 拼点群攻：clash_aoe=True（若要同时无差别，再加 indiscriminate=True）
+改了events
+改了models
+改了combot
