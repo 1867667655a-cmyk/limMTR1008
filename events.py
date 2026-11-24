@@ -28,6 +28,10 @@ class EventType(Enum):
     CLASH_LOSE = auto()
     UNOPPOSED_ATTACK_START = auto()
 
+    # 不可摧毁技能/变动值阶段
+    BEFORE_UNBREAKABLE_RESOLVE = auto()  # 可用于强行摧毁不可摧毁技能、修改保底点数等
+    UNBREAKABLE_ATTACK_START = auto()
+
     BEFORE_SKILL_ROLL = auto()   # 修改基础值、硬币数量、硬币面值、概率
     AFTER_SKILL_ROLL = auto()    # 重投、强制加减点数
     SKILL_DESTROYED = auto()
@@ -43,11 +47,14 @@ class EventType(Enum):
 
     CHARACTER_DEATH = auto()
     AUTO_ROLL_TOGGLED = auto()   # 自动投掷开关切换
-    PASSIVE_TRIGGERED = auto()
+    PASSIVE_TRIGGERED = auto()   # 被动触发
 
+    # BGM 系统
     BGM_PRIORITY_EVAL = auto()
     BGM_PRIORITY_CHANGED = auto()
     BGM_CHANGED = auto()
+
+
 @dataclass
 class EventContext:
     event_type: EventType
@@ -77,10 +84,6 @@ class EventBus:
         priority: int = 0,
         owner: Any = None,
     ) -> int:
-        """
-        注册事件监听。
-        priority 越小越先执行（如 -100 先于 0，100 最后兜底）。
-        """
         lid = self._next_id
         self._next_id += 1
         listener = _Listener(lid, event_type, callback, priority, owner)
