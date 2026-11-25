@@ -30,21 +30,22 @@ class BurnStatus(StatusEffect):
         self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=10)
 
     def _on_turn_end(self, ctx: EventContext) -> None:
-        if not self.owner or not self.owner.alive or self.stacks <= 0:
+        owner = self.owner
+        if not owner or not owner.alive or self.stacks <= 0:
             return
         dmg = self.stacks
         engine: "CombatEngine" = ctx.engine
-        engine.log(f"  [烧伤] {self.owner.name} 受到 {dmg} 点烧伤伤害")
+        engine.log(f"  [烧伤] {owner.name} 受到 {dmg} 点烧伤伤害")
         engine.apply_damage(
             attacker=None,
-            target=self.owner,
+            target=owner,
             raw_damage=dmg,
             source_type="dot_burn",
             trigger_on_hit_statuses=False,
             allow_breath=False,
         )
-        if self.owner and self.owner.alive:
-            engine.set_status_stacks(self.owner, self.name, _halve(self.stacks))
+        if owner.alive:
+            engine.set_status_stacks(owner, self.name, _halve(self.stacks))
 
 
 class TremorStatus(StatusEffect):
@@ -58,9 +59,10 @@ class TremorStatus(StatusEffect):
         self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=10)
 
     def _on_turn_end(self, ctx: EventContext) -> None:
-        if not self.owner or not self.owner.alive or self.stacks <= 0:
+        owner = self.owner
+        if not owner or not owner.alive or self.stacks <= 0:
             return
-        ctx.engine.set_status_stacks(self.owner, self.name, max(0, self.stacks - 1))
+        ctx.engine.set_status_stacks(owner, self.name, max(0, self.stacks - 1))
 
 
 def burst_tremor(
@@ -104,18 +106,19 @@ class BleedStatus(StatusEffect):
         self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=10)
 
     def _on_clash_start(self, ctx: EventContext) -> None:
-        if not self.owner or not self.owner.alive or self.stacks <= 0:
+        owner = self.owner
+        if not owner or not owner.alive or self.stacks <= 0:
             return
         act1 = ctx.data["action1"]
         act2 = ctx.data["action2"]
-        if self.owner not in (act1.actor, act2.actor):
+        if owner not in (act1.actor, act2.actor):
             return
         dmg = self.stacks
         engine: "CombatEngine" = ctx.engine
-        engine.log(f"  [流血] {self.owner.name} 拼点触发流血，受到 {dmg} 点伤害")
+        engine.log(f"  [流血] {owner.name} 拼点触发流血，受到 {dmg} 点伤害")
         engine.apply_damage(
             attacker=None,
-            target=self.owner,
+            target=owner,
             raw_damage=dmg,
             source_type="dot_bleed",
             trigger_on_hit_statuses=False,
@@ -123,9 +126,10 @@ class BleedStatus(StatusEffect):
         )
 
     def _on_turn_end(self, ctx: EventContext) -> None:
-        if not self.owner or not self.owner.alive or self.stacks <= 0:
+        owner = self.owner
+        if not owner or not owner.alive or self.stacks <= 0:
             return
-        ctx.engine.set_status_stacks(self.owner, self.name, _halve(self.stacks))
+        ctx.engine.set_status_stacks(owner, self.name, _halve(self.stacks))
 
 
 class CorrosionStatus(StatusEffect):
@@ -141,16 +145,17 @@ class CorrosionStatus(StatusEffect):
 
     def _on_take_damage(self, ctx: EventContext) -> None:
         dmg_ctx: DamageContext = ctx.data["damage_context"]
-        if dmg_ctx.target is not self.owner or not self.owner.alive or self.stacks <= 0:
+        owner = self.owner
+        if dmg_ctx.target is not owner or owner is None or not owner.alive or self.stacks <= 0:
             return
         if not dmg_ctx.trigger_on_hit_statuses:
             return
         dmg = self.stacks
         engine: "CombatEngine" = ctx.engine
-        engine.log(f"  [腐蚀] {self.owner.name} 受击触发腐蚀，额外受到 {dmg} 点伤害")
+        engine.log(f"  [腐蚀] {owner.name} 受击触发腐蚀，额外受到 {dmg} 点伤害")
         engine.apply_damage(
             attacker=None,
-            target=self.owner,
+            target=owner,
             raw_damage=dmg,
             source_type="dot_corrosion_hit",
             trigger_on_hit_statuses=False,
@@ -158,21 +163,22 @@ class CorrosionStatus(StatusEffect):
         )
 
     def _on_turn_end(self, ctx: EventContext) -> None:
-        if not self.owner or not self.owner.alive or self.stacks <= 0:
+        owner = self.owner
+        if not owner or not owner.alive or self.stacks <= 0:
             return
         dmg = self.stacks
         engine: "CombatEngine" = ctx.engine
-        engine.log(f"  [腐蚀] {self.owner.name} 回合结束受到 {dmg} 点腐蚀伤害")
+        engine.log(f"  [腐蚀] {owner.name} 回合结束受到 {dmg} 点腐蚀伤害")
         engine.apply_damage(
             attacker=None,
-            target=self.owner,
+            target=owner,
             raw_damage=dmg,
             source_type="dot_corrosion_end",
             trigger_on_hit_statuses=False,
             allow_breath=False,
         )
-        if self.owner and self.owner.alive:
-            engine.set_status_stacks(self.owner, self.name, _halve(self.stacks))
+        if owner.alive:
+            engine.set_status_stacks(owner, self.name, _halve(self.stacks))
 
 
 class RuptureStatus(StatusEffect):
@@ -210,6 +216,111 @@ class RuptureStatus(StatusEffect):
         )
 
 
+class DamageDownStatus(StatusEffect):
+    """伤害下降 [减益]：造成的伤害每层减少 10%（向下取整），每回合清零"""
+
+    def __init__(self, stacks: int = 1):
+        super().__init__("伤害下降", stacks=stacks, category="debuff")
+
+    def on_attach(self, engine: "CombatEngine", owner: Character) -> None:
+        super().on_attach(engine, owner)
+        self.bind(engine, EventType.CALCULATE_DAMAGE, self._on_calc_damage, priority=10)
+        self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=90)
+
+    def _on_calc_damage(self, ctx: EventContext) -> None:
+        dmg_ctx: DamageContext = ctx.data["damage_context"]
+        if dmg_ctx.attacker is not self.owner or self.stacks <= 0 or dmg_ctx.damage <= 0:
+            return
+        before = dmg_ctx.damage
+        rate = max(0, 100 - 10 * self.stacks)
+        dmg_ctx.mul_percent(rate)
+        if dmg_ctx.damage != before:
+            ctx.engine.log(
+                f"  [伤害下降] {self.owner.name} ({self.stacks}层) 降伤 {100 - rate}%: {before} -> {dmg_ctx.damage}"
+            )
+
+    def _on_turn_end(self, ctx: EventContext) -> None:
+        if self.owner:
+            ctx.engine.set_status_stacks(self.owner, self.name, 0)
+
+
+class FragileStatus(StatusEffect):
+    """易损 [减益]：受到的伤害每层增加 10%（向下取整，DoT 与追加伤害不生效），每回合清零"""
+
+    def __init__(self, stacks: int = 1):
+        super().__init__("易损", stacks=stacks, category="debuff")
+
+    def on_attach(self, engine: "CombatEngine", owner: Character) -> None:
+        super().on_attach(engine, owner)
+        self.bind(engine, EventType.BEFORE_TAKE_DAMAGE, self._on_before_take_damage, priority=10)
+        self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=90)
+
+    def _on_before_take_damage(self, ctx: EventContext) -> None:
+        dmg_ctx: DamageContext = ctx.data["damage_context"]
+        if dmg_ctx.target is not self.owner or self.stacks <= 0 or dmg_ctx.damage <= 0:
+            return
+        if dmg_ctx.ignore_protection_fragile:
+            return
+        before = dmg_ctx.damage
+        pct = 100 + 10 * self.stacks
+        dmg_ctx.mul_percent(pct)
+        if dmg_ctx.damage != before:
+            ctx.engine.log(
+                f"  [易损] {self.owner.name} ({self.stacks}层) 受击增伤 +{10 * self.stacks}%: {before} -> {dmg_ctx.damage}"
+            )
+
+    def _on_turn_end(self, ctx: EventContext) -> None:
+        if self.owner:
+            ctx.engine.set_status_stacks(self.owner, self.name, 0)
+
+
+class WeakStatus(StatusEffect):
+    """虚弱 [减益]：技能威力每层减 1，每回合清零"""
+
+    def __init__(self, stacks: int = 1):
+        super().__init__("虚弱", stacks=stacks, category="debuff")
+
+    def on_attach(self, engine: "CombatEngine", owner: Character) -> None:
+        super().on_attach(engine, owner)
+        self.bind(engine, EventType.BEFORE_SKILL_ROLL, self._on_before_roll, priority=0)
+        self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=90)
+
+    def _on_before_roll(self, ctx: EventContext) -> None:
+        if ctx.data["actor"] is not self.owner or self.stacks <= 0:
+            return
+        ctx.data["roll_state"]["base_power"] -= self.stacks
+
+    def _on_turn_end(self, ctx: EventContext) -> None:
+        if self.owner:
+            ctx.engine.set_status_stacks(self.owner, self.name, 0)
+
+
+class CoinPowerDownStatus(StatusEffect):
+    """硬币威力弱化 [减益]：变动值威力每层减 1，每回合清零"""
+
+    def __init__(self, stacks: int = 1):
+        super().__init__("硬币威力弱化", stacks=stacks, category="debuff")
+
+    def on_attach(self, engine: "CombatEngine", owner: Character) -> None:
+        super().on_attach(engine, owner)
+        # priority=50 确保先吃完“硬币威力强化 / 愤怒”等加值后再减算，正向硬币下限保底为 0
+        self.bind(engine, EventType.BEFORE_SKILL_ROLL, self._on_before_roll, priority=50)
+        self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=90)
+
+    def _on_before_roll(self, ctx: EventContext) -> None:
+        if ctx.data["actor"] is not self.owner or self.stacks <= 0:
+            return
+        for coin in ctx.data["roll_state"]["coins"]:
+            if coin.value >= 0:
+                coin.value = max(0, coin.value - self.stacks)
+            else:
+                coin.value -= self.stacks
+
+    def _on_turn_end(self, ctx: EventContext) -> None:
+        if self.owner:
+            ctx.engine.set_status_stacks(self.owner, self.name, 0)
+
+
 # ==============================================================================
 # 增益状态 (Buffs)
 # ==============================================================================
@@ -233,7 +344,8 @@ class BreathStatus(StatusEffect):
 
     def _on_calc_damage(self, ctx: EventContext) -> None:
         dmg_ctx: DamageContext = ctx.data["damage_context"]
-        if dmg_ctx.attacker is not self.owner or not dmg_ctx.allow_breath:
+        owner = self.owner
+        if dmg_ctx.attacker is not owner or owner is None or not dmg_ctx.allow_breath:
             return
         if self.stacks <= 0 or dmg_ctx.damage <= 0:
             return
@@ -245,14 +357,14 @@ class BreathStatus(StatusEffect):
 
         engine: "CombatEngine" = ctx.engine
         engine.log(
-            f"  [呼吸] {self.owner.name} 消耗 {consumed} 层呼吸（剩余 {remaining}），"
+            f"  [呼吸] {owner.name} 消耗 {consumed} 层呼吸（剩余 {remaining}），"
             f"伤害 {before_dmg} -> {dmg_ctx.damage} (+{consumed}%)"
         )
-        engine.set_status_stacks(self.owner, self.name, remaining)
+        engine.set_status_stacks(owner, self.name, remaining)
 
 
 class ProtectionStatus(StatusEffect):
-    """守护 [增益]：受到的伤害每层减 10%（向下取整），每回合清零"""
+    """守护 [增益]：受到的伤害每层减 10%（向下取整，DoT 与追加伤害不生效），每回合清零"""
 
     def __init__(self, stacks: int = 1):
         super().__init__("守护", stacks=stacks, category="buff")
@@ -265,6 +377,8 @@ class ProtectionStatus(StatusEffect):
     def _on_before_take_damage(self, ctx: EventContext) -> None:
         dmg_ctx: DamageContext = ctx.data["damage_context"]
         if dmg_ctx.target is not self.owner or self.stacks <= 0 or dmg_ctx.damage <= 0:
+            return
+        if dmg_ctx.ignore_protection_fragile:
             return
         rate = max(0, 100 - 10 * self.stacks)
         before = dmg_ctx.damage
@@ -318,9 +432,32 @@ class DamageUpStatus(StatusEffect):
         before = dmg_ctx.damage
         pct = 100 + 10 * self.stacks
         dmg_ctx.mul_percent(pct)
-        ctx.engine.log(
-            f"  [伤害提升] {self.owner.name} ({self.stacks}层) 增伤 +{10 * self.stacks}%: {before} -> {dmg_ctx.damage}"
-        )
+        if dmg_ctx.damage != before:
+            ctx.engine.log(
+                f"  [伤害提升] {self.owner.name} ({self.stacks}层) 增伤 +{10 * self.stacks}%: {before} -> {dmg_ctx.damage}"
+            )
+
+    def _on_turn_end(self, ctx: EventContext) -> None:
+        if self.owner:
+            ctx.engine.set_status_stacks(self.owner, self.name, 0)
+
+
+class CoinPowerUpStatus(StatusEffect):
+    """硬币威力强化 [增益]：变动值威力每层加 1，每回合清零"""
+
+    def __init__(self, stacks: int = 1):
+        super().__init__("硬币威力强化", stacks=stacks, category="buff")
+
+    def on_attach(self, engine: "CombatEngine", owner: Character) -> None:
+        super().on_attach(engine, owner)
+        self.bind(engine, EventType.BEFORE_SKILL_ROLL, self._on_before_roll, priority=0)
+        self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=90)
+
+    def _on_before_roll(self, ctx: EventContext) -> None:
+        if ctx.data["actor"] is not self.owner or self.stacks <= 0:
+            return
+        for coin in ctx.data["roll_state"]["coins"]:
+            coin.value += self.stacks
 
     def _on_turn_end(self, ctx: EventContext) -> None:
         if self.owner:
@@ -347,6 +484,10 @@ def register_default_statuses() -> None:
     register_status("流血", BleedStatus, "debuff")
     register_status("腐蚀", CorrosionStatus, "debuff")
     register_status("破裂", RuptureStatus, "debuff")
+    register_status("伤害下降", DamageDownStatus, "debuff")
+    register_status("易损", FragileStatus, "debuff")
+    register_status("虚弱", WeakStatus, "debuff")
+    register_status("硬币威力弱化", CoinPowerDownStatus, "debuff")
 
     # 增益 (buff)
     register_status("充能", ChargeStatus, "buff")
@@ -354,3 +495,4 @@ def register_default_statuses() -> None:
     register_status("守护", ProtectionStatus, "buff")
     register_status("强壮", StrengthStatus, "buff")
     register_status("伤害提升", DamageUpStatus, "buff")
+    register_status("硬币威力强化", CoinPowerUpStatus, "buff")
