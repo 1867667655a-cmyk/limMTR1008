@@ -24,6 +24,8 @@ class CombatEngine:
         roll_handler: Optional[Any] = None,
         show_turn_board: bool = True,
         audio_backend: Optional[AudioBackend] = None,
+        allow_ally_target: bool = True,
+        allow_ally_clash: bool = True,
     ):
         register_default_statuses()
         self.events = EventBus()
@@ -37,6 +39,8 @@ class CombatEngine:
         self.auto_roll: bool = auto_roll
         self.roll_handler: Optional[Any] = roll_handler
         self.show_turn_board: bool = show_turn_board
+        self.allow_ally_target: bool = allow_ally_target
+        self.allow_ally_clash: bool = allow_ally_clash
         self.bgm = BGMManager(self, audio_backend=audio_backend)
 
         self.round_num: int = 0
@@ -112,10 +116,59 @@ class CombatEngine:
             return "DRAW"
         return None
 
+    def can_target_ally(self, char: Character, skill: Skill) -> bool:
+        if skill.target_type in (
+            "single_ally",
+            "other_ally",
+            "single_any",
+            "all_allies",
+            "all_other_allies",
+            "all_others",
+        ) or skill.indiscriminate:
+            return True
+        if skill.target_type == "self":
+            return False
+        if skill.allow_ally_target is not None:
+            return bool(skill.allow_ally_target)
+        return self.allow_ally_target
+
+    def get_selectable_targets(
+        self, char: Character, skill: Skill, for_ai: bool = False
+    ) -> List[Character]:
+        enemies = self.get_enemies(char)
+        other_allies = self.get_allies(char, include_self=False)
+        allies = self.get_allies(char, include_self=True)
+
+        if skill.target_type == "self":
+            return [char] if char.alive else []
+        if skill.target_type == "single_ally":
+            return allies
+        if skill.target_type == "other_ally":
+            return other_allies
+        if skill.target_type == "single_any":
+            return enemies + other_allies
+        if skill.target_type == "all_allies":
+            return allies
+        if skill.target_type == "all_other_allies":
+            return other_allies
+        if skill.is_aoe and not skill.clash_aoe:
+            if skill.indiscriminate or skill.target_type == "all_others":
+                return [c for c in self.get_living_characters() if c is not char]
+            return enemies
+
+        # 单体攻击与拼点群攻的拼点目标：AI 默认不主动攻击队友，玩家手动时可选择攻击队友
+        if not for_ai and self.can_target_ally(char, skill):
+            return enemies + other_allies
+        return enemies
+
     def _get_aoe_targets(self, act: Action) -> List[Character]:
         assert act.skill is not None
         if act.skill.indiscriminate or act.skill.target_type == "all_others":
             return [c for c in self.get_living_characters() if c is not act.actor]
+        if act.skill.target_type == "all_allies":
+            return self.get_allies(act.actor, include_self=True)
+        if act.skill.target_type == "all_other_allies":
+            return self.get_allies(act.actor, include_self=False)
         return self.get_enemies(act.actor)
 
     # ------------------------------------------------------------------
@@ -434,26 +487,26 @@ class CombatEngine:
     def _default_ai_select(
         self, char: Character, slot_idx: int, previous_selections: List[Action]
     ) -> Action:
-        usable = char.get_usable_skills(self)
-        enemies = self.get_enemies(char)
-        if not usable or not enemies:
+        usable = [
+            sk
+            for sk in char.get_usable_skills(self)
+            if self.get_selectable_targets(char, sk, for_ai=True)
+        ]
+        if not usable:
             return Action(actor=char, skill=None, targets=[], consume_from_hand=False)
 
         skill = self.rng.choice(usable)
+        pool = self.get_selectable_targets(char, skill, for_ai=True)
+
         if skill.clash_aoe:
-            # 拼点群攻：只选 1 名敌人作为拼点目标，胜出后再释放全范围打击
-            targets = [self.rng.choice(enemies)]
-        elif skill.is_aoe and (skill.indiscriminate or skill.target_type == "all_others"):
-            targets = [c for c in self.get_living_characters() if c is not char]
-        elif skill.is_aoe or skill.target_type == "all_enemies":
-            targets = list(enemies)
+            # 拼点群攻：只选 1 名目标作为拼点对象，胜出后再释放全范围打击
+            targets = [self.rng.choice(pool)]
+        elif skill.is_aoe:
+            targets = list(pool)
         elif skill.target_type == "self":
             targets = [char]
-        elif skill.target_type == "single_ally":
-            allies = self.get_allies(char)
-            targets = [self.rng.choice(allies)] if allies else [char]
         else:
-            targets = [self.rng.choice(enemies)]
+            targets = [self.rng.choice(pool)]
 
         return Action(actor=char, skill=skill, targets=targets)
 
@@ -581,7 +634,10 @@ class CombatEngine:
             )
 
             if action.skill:
-                tgt_names = ",".join(t.name for t in action.targets)
+                tgt_names = ",".join(
+                    f"{t.name}[队友]" if (t.team == char.team and t is not char) else t.name
+                    for t in action.targets
+                )
                 self.log(
                     f"[选技] {char.name} 选择 [{action.skill.name}({action.skill.format_formula()})] -> {tgt_names}"
                 )
@@ -698,7 +754,9 @@ class CombatEngine:
             for j, a2 in enumerate(actions):
                 if j == i or j in used or not _can_clash(a2):
                     continue
-                if a1.actor.team == a2.actor.team:
+                if a1.actor is a2.actor:
+                    continue
+                if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
                     continue
                 if a2.actor in a1.targets and a1.actor in a2.targets:
                     matched_idx = j
@@ -708,7 +766,9 @@ class CombatEngine:
                 for j, a2 in enumerate(actions):
                     if j == i or j in used or not _can_clash(a2):
                         continue
-                    if a1.actor.team == a2.actor.team:
+                    if a1.actor is a2.actor:
+                        continue
+                    if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
                         continue
                     if a2.actor in a1.targets:
                         matched_idx = j
@@ -731,7 +791,9 @@ class CombatEngine:
                     a2 = actions[j]
                     if not _can_clash(a2):
                         continue
-                    if a1.actor.team == a2.actor.team:
+                    if a1.actor is a2.actor:
+                        continue
+                    if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
                         continue
                     if a2.actor in a1.targets and a1.actor in a2.targets:
                         used.add(i)
