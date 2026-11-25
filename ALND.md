@@ -11,3 +11,8 @@ engine/statuses.py修复
 更新不可摧毁硬币engine/combat.py、engine/models.py、engine/events.py
 可给技能硬币额外定义“unbreakable=True”以调用，例：
 coins=[Coin(3), Coin(3), Coin(3, unbreakable=True)]
+
+
+
+2026/11/25 23:39
+fw0+7做的群攻有bug,现已修复,更新了engine/combat.py、main.py
