@@ -87,10 +87,12 @@ def cli_manual_selector(
     slot_idx: int,
     previous_selections: List[Action],
 ) -> Action:
-    """文本交互选技：任意输入阶段均可通过输入 a/auto 切换自动投掷"""
-    usable = char.get_usable_skills(engine)
-    enemies = engine.get_enemies(char)
-    allies = engine.get_allies(char)
+    """文本交互选技：任意输入阶段均可通过输入 a/auto 切换自动投掷；支持选择攻击队友"""
+    usable = [
+        sk
+        for sk in char.get_usable_skills(engine)
+        if sk.is_aoe or sk.clash_aoe or engine.get_selectable_targets(char, sk, for_ai=False)
+    ]
 
     print(
         f"\n>>> 轮到 [{char.team}] {char.name} (HP: {char.hp}/{char.max_hp}) 选择技能 "
@@ -100,14 +102,17 @@ def cli_manual_selector(
         print("  [本回合已选情报]")
         for act in previous_selections:
             s_name = f"{act.skill.name}({act.skill.format_formula()})" if act.skill else "无技能(挨打)"
-            tgts = ",".join(t.name for t in act.targets) or "-"
+            tgts = ",".join(
+                f"{t.name}[队友]" if (t.team == act.actor.team and t is not act.actor) else t.name
+                for t in act.targets
+            ) or "-"
             print(f"    - [{act.actor.team}] {act.actor.name}: {s_name} -> {tgts}")
 
     if char.statuses:
         st_str = ", ".join(f"{k}:{v.stacks}" for k, v in char.statuses.items())
         print(f"  [自身状态] {st_str}")
 
-    if not usable or not enemies:
+    if not usable:
         print("  当前无可用技能，本回合只能挨打。")
         return Action(actor=char, skill=None, targets=[], consume_from_hand=False)
 
@@ -126,46 +131,44 @@ def cli_manual_selector(
             break
         print("  输入无效，请重新输入。")
 
-    if chosen_skill.target_type == "all_enemies":
-        targets = list(enemies)
+    candidates = engine.get_selectable_targets(char, chosen_skill, for_ai=False)
+
+    def _pick_single_target(prompt_title: str, pool: List[Character]) -> List[Character]:
+        if not pool:
+            return []
+        if len(pool) == 1:
+            return [pool[0]]
+        print(f"  [{prompt_title}]")
+        for idx, tgt in enumerate(pool):
+            if tgt is char:
+                side = "自身"
+            elif tgt.team == char.team:
+                side = "友方/队友"
+            else:
+                side = "敌方"
+            st = ", ".join(f"{k}:{v.stacks}" for k, v in tgt.statuses.items())
+            st_info = f" | 状态: {st}" if st else ""
+            print(f"    {idx}: [{side}] {tgt.name} (HP:{tgt.hp}/{tgt.max_hp}{st_info})")
+        while True:
+            traw = input("  请输入目标编号 (输入 a 可切换自动投掷): ").strip().lower()
+            if traw in ("a", "auto", "t"):
+                state = engine.toggle_auto_roll()
+                print(f"  [系统] 自动投掷已{'开启' if state else '关闭'}！")
+                continue
+            if traw.isdigit() and 0 <= int(traw) < len(pool):
+                return [pool[int(traw)]]
+            print("  输入无效，请重新输入。")
+
+    if chosen_skill.clash_aoe:
+        hint = "无差别群攻（敌人+队友）" if chosen_skill.indiscriminate else "群攻（全体敌人）"
+        print(f"  [提示] 该技能为拼点群攻，请选择 1 名目标进行拼点，胜出后将直接释放{hint}！")
+        targets = _pick_single_target("选择拼点目标", candidates)
+    elif chosen_skill.is_aoe:
+        targets = list(candidates)
     elif chosen_skill.target_type == "self":
         targets = [char]
-    elif chosen_skill.target_type == "single_ally":
-        if len(allies) == 1:
-            targets = [allies[0]]
-        else:
-            print("  [选择友方目标]")
-            for idx, al in enumerate(allies):
-                print(f"    {idx}: {al.name} (HP:{al.hp}/{al.max_hp})")
-            while True:
-                traw = input("  请输入目标编号 (输入 a 可切换自动投掷): ").strip().lower()
-                if traw in ("a", "auto", "t"):
-                    state = engine.toggle_auto_roll()
-                    print(f"  [系统] 自动投掷已{'开启' if state else '关闭'}！")
-                    continue
-                if traw.isdigit() and 0 <= int(traw) < len(allies):
-                    targets = [allies[int(traw)]]
-                    break
-                print("  输入无效，请重新输入。")
     else:
-        if len(enemies) == 1:
-            targets = [enemies[0]]
-        else:
-            print("  [选择敌方目标]")
-            for idx, en in enumerate(enemies):
-                st = ", ".join(f"{k}:{v.stacks}" for k, v in en.statuses.items())
-                st_info = f" | 状态: {st}" if st else ""
-                print(f"    {idx}: {en.name} (HP:{en.hp}/{en.max_hp}{st_info})")
-            while True:
-                traw = input("  请输入目标编号 (输入 a 可切换自动投掷): ").strip().lower()
-                if traw in ("a", "auto", "t"):
-                    state = engine.toggle_auto_roll()
-                    print(f"  [系统] 自动投掷已{'开启' if state else '关闭'}！")
-                    continue
-                if traw.isdigit() and 0 <= int(traw) < len(enemies):
-                    targets = [enemies[int(traw)]]
-                    break
-                print("  输入无效，请重新输入。")
+        targets = _pick_single_target("选择目标", candidates)
 
     return Action(actor=char, skill=chosen_skill, targets=targets)
 
@@ -185,7 +188,7 @@ def main() -> None:
 
     auto_choice = input("是否开启【自动投掷】？(y 开启 / n 关闭手动逐枚按空格揭晓，默认 n): ").strip().lower()
     initial_auto = auto_choice in ("y", "yes", "1", "是")
-    print(f"提示：战斗中随时可按 [A]（投掷时）或输入 [a]（选技时）开启/关闭自动投掷！\n")
+    print("提示：战斗中随时可按 [A]（投掷时）或输入 [a]（选技时）开启/关闭自动投掷；选目标时可直接选择 [友方/队友] 进行攻击！\n")
 
     roll_handler = InteractiveRollHandler(auto_delay=0.18)
     engine = CombatEngine(
