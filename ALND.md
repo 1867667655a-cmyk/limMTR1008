@@ -15,3 +15,7 @@ coins=[Coin(3), Coin(3), Coin(3, unbreakable=True)]
 
 2026/11/25 23:39
 fw0+7做的群攻有bug,现已修复,更新了engine/combat.py、main.py
+
+
+2026/11/26 00:03
+新增通用更多buff和追加伤害方法，更新了engine/statuses.py、engine/models.py、engine/combat.py、engine/__init__.py
