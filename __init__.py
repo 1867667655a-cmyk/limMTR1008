@@ -18,4 +18,9 @@ from .statuses import (
     burst_tremor,
     register_default_statuses,
     register_status,
+    CoinPowerDownStatus,
+    CoinPowerUpStatus,
+    DamageDownStatus,
+    FragileStatus,
+    WeakStatus,
 )
