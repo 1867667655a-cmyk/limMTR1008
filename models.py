@@ -36,9 +36,12 @@ class DamageContext:
     raw_damage: int
     damage: int
     skill: Optional["Skill"] = None
-    source_type: str = "skill"  # "skill" | "dot" | "pursuit" | "unbreakable" | "aoe" | custom
+    source_type: str = "skill"  # "skill" | "dot_*" | "pursuit" | "unbreakable" | "aoe" | "bonus"
     trigger_on_hit_statuses: bool = True
     allow_breath: bool = True
+    is_dot: bool = False
+    is_bonus_damage: bool = False
+    ignore_protection_fragile: bool = False  # True 时无视易损与守护
     cancelled: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -50,7 +53,6 @@ class DamageContext:
 
     def mul_ratio(self, numerator: int, denominator: int) -> None:
         self.damage = floor_mul(self.damage, numerator, denominator)
-
 
 class Skill:
     """技能基类"""
