@@ -68,6 +68,7 @@ class Skill:
         is_aoe: Optional[bool] = None,          # True 表示群攻技能（默认按 target_type / clash_aoe / indiscriminate 自动识别）
         clash_aoe: bool = False,                # True 表示拼点群攻（先与1人拼点，胜出直接释放群攻）
         indiscriminate: Optional[bool] = None,  # True 表示无差别攻击（同时攻击敌人与队友）
+        allow_ally_target: Optional[bool] = None,  # None=跟随引擎设置；True=允许选队友；False=禁止选队友
         tags: Optional[Set[str]] = None,
         extra_data: Optional[Dict[str, Any]] = None,
     ):
@@ -89,11 +90,12 @@ class Skill:
             (
                 self.clash_aoe
                 or self.indiscriminate
-                or target_type in ("all_enemies", "all_others", "aoe")
+                or target_type in ("all_enemies", "all_allies", "all_other_allies", "all_others", "aoe")
             )
             if is_aoe is None
             else bool(is_aoe)
         )
+        self.allow_ally_target: Optional[bool] = allow_ally_target
         self.tags: Set[str] = set(tags) if tags else set()
         self.extra_data: Dict[str, Any] = dict(extra_data) if extra_data else {}
 
@@ -139,6 +141,7 @@ class Skill:
                 is_aoe=self.is_aoe,
                 clash_aoe=self.clash_aoe,
                 indiscriminate=self.indiscriminate,
+                allow_ally_target=self.allow_ally_target,
                 tags=set(self.tags),
                 extra_data=dict(self.extra_data),
             )
