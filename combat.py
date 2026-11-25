@@ -357,9 +357,22 @@ class CombatEngine:
         source_type: str = "skill",
         trigger_on_hit_statuses: bool = True,
         allow_breath: bool = True,
+        is_dot: Optional[bool] = None,
+        is_bonus_damage: bool = False,
+        ignore_protection_fragile: Optional[bool] = None,
     ) -> int:
         if not target.alive:
             return 0
+
+        resolved_is_dot = source_type.startswith("dot") if is_dot is None else is_dot
+        resolved_is_bonus = is_bonus_damage or (
+            source_type in ("bonus", "additional", "extra", "追加伤害")
+        )
+        resolved_ignore_pf = (
+            (resolved_is_dot or resolved_is_bonus)
+            if ignore_protection_fragile is None
+            else ignore_protection_fragile
+        )
 
         dmg_ctx = DamageContext(
             attacker=attacker,
@@ -370,6 +383,9 @@ class CombatEngine:
             source_type=source_type,
             trigger_on_hit_statuses=trigger_on_hit_statuses,
             allow_breath=allow_breath,
+            is_dot=resolved_is_dot,
+            is_bonus_damage=resolved_is_bonus,
+            ignore_protection_fragile=resolved_ignore_pf,
         )
 
         if skill and action:
@@ -419,6 +435,35 @@ class CombatEngine:
         self._check_death(target, killer=attacker, damage_context=dmg_ctx)
         self.bgm.evaluate(reason="生命值变化")
         return actual_loss
+
+    def apply_bonus_damage(
+        self,
+        attacker: Optional[Character],
+        target: Character,
+        raw_damage: int,
+        skill: Optional[Skill] = None,
+        action: Optional[Action] = None,
+        trigger_on_hit_statuses: bool = False,
+        allow_breath: bool = False,
+        source_type: str = "bonus",
+    ) -> int:
+        """
+        追加伤害专用接口：
+        自动标记 is_bonus_damage=True、ignore_protection_fragile=True，
+        不会因【易损】加伤，也不会因【守护】减伤。
+        """
+        return self.apply_damage(
+            attacker=attacker,
+            target=target,
+            raw_damage=raw_damage,
+            skill=skill,
+            action=action,
+            source_type=source_type,
+            trigger_on_hit_statuses=trigger_on_hit_statuses,
+            allow_breath=allow_breath,
+            is_bonus_damage=True,
+            ignore_protection_fragile=True,
+        )
 
     def _check_death(
         self,
