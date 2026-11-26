@@ -22,5 +22,6 @@ from .statuses import (
     CoinPowerUpStatus,
     DamageDownStatus,
     FragileStatus,
+    ParalyzeStatus,
     WeakStatus,
 )
