@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import random
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
-from .bgm import AudioBackend, BGMManager
+from .bgm import AudioBackend, BGMManager, PygameAudioBackend
 from .events import EventBus, EventType
 from .math_utils import floor_val
 from .models import Action, Character, Coin, DamageContext, Skill, StatusEffect
@@ -24,6 +25,7 @@ class CombatEngine:
         roll_handler: Optional[Any] = None,
         show_turn_board: bool = True,
         audio_backend: Optional[AudioBackend] = None,
+        bgm_dir: Optional[Union[str, Path]] = None,
         allow_ally_target: bool = True,
         allow_ally_clash: bool = True,
     ):
@@ -41,7 +43,9 @@ class CombatEngine:
         self.show_turn_board: bool = show_turn_board
         self.allow_ally_target: bool = allow_ally_target
         self.allow_ally_clash: bool = allow_ally_clash
-        self.bgm = BGMManager(self, audio_backend=audio_backend)
+
+        backend = audio_backend or PygameAudioBackend(bgm_dir=bgm_dir or Path("bgm"))
+        self.bgm = BGMManager(self, audio_backend=backend)
 
         self.round_num: int = 0
         self.turn_in_round: int = 0
@@ -544,7 +548,6 @@ class CombatEngine:
         pool = self.get_selectable_targets(char, skill, for_ai=True)
 
         if skill.clash_aoe:
-            # 拼点群攻：只选 1 名目标作为拼点对象，胜出后再释放全范围打击
             targets = [self.rng.choice(pool)]
         elif skill.is_aoe:
             targets = list(pool)
@@ -562,9 +565,8 @@ class CombatEngine:
         self.log("[场上状态]")
         if self.bgm.current_track:
             tr = self.bgm.current_track
-            prog = self.bgm._sync_current_progress()
             owner_name = tr.owner.name if tr.owner else "场地"
-            self.log(f"  [当前BGM] {owner_name} - 《{tr.title}》(单曲循环 | 进度: {prog:.2f}s)")
+            self.log(f"  [当前BGM] 《{tr.title}》({owner_name})")
         for c in self.get_living_characters():
             st_str = (
                 " | 状态: "
@@ -588,11 +590,14 @@ class CombatEngine:
         self.events.emit(EventType.GAME_START, self)
         self.bgm.evaluate(reason="战斗开始")
 
-        while not self.game_over and self.round_num < self.max_rounds:
-            self.round_num += 1
-            self.run_round()
-            if self.check_victory():
-                break
+        try:
+            while not self.game_over and self.round_num < self.max_rounds:
+                self.round_num += 1
+                self.run_round()
+                if self.check_victory():
+                    break
+        finally:
+            pass
 
         self.events.emit(EventType.GAME_END, self, winner=self.winner_team)
         self.log(f"=== 战斗结束，胜者：{self.winner_team} ===")
@@ -702,7 +707,7 @@ class CombatEngine:
             if not a.cancelled and a.skill is not None
         ]
 
-        # 1) 非拼点群攻优先结算（同队普通群攻不争夺释放权，除非含无差别群攻或有敌对群攻）
+        # 1) 非拼点群攻优先结算
         non_clash_aoes = [
             a for a in planned
             if a.skill is not None and a.skill.is_aoe and not a.skill.clash_aoe and a.actor.alive
@@ -727,7 +732,6 @@ class CombatEngine:
                 )
                 self._drain_pursuit_queue()
 
-            # 若有在群攻竞争中落败的非拼点红币群攻，等胜出的群攻全部释放完后，再以碎币范围生效
             if winners and not self.check_victory():
                 for act in non_clash_aoes:
                     if self.check_victory():
@@ -790,12 +794,33 @@ class CombatEngine:
                 and (not act.skill.is_aoe or act.skill.clash_aoe)
             )
 
-        # 1) 优先为【拼点群攻】配对（先匹配互指，若目标选了别人则强制拉住该目标进入1v1拼点）
+        # 1) 先匹配所有【双方互指】的拼点（优先让 clash_aoe 的互指先匹配）
+        indices = sorted(
+            range(len(actions)),
+            key=lambda idx: 0 if (actions[idx].skill and actions[idx].skill.clash_aoe) else 1,
+        )
+        for i in indices:
+            if i in used or not _can_clash(actions[i]):
+                continue
+            a1 = actions[i]
+            for j in range(len(actions)):
+                if j == i or j in used or not _can_clash(actions[j]):
+                    continue
+                a2 = actions[j]
+                if a1.actor is a2.actor:
+                    continue
+                if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
+                    continue
+                if a2.actor in a1.targets and a1.actor in a2.targets:
+                    used.add(i)
+                    used.add(j)
+                    clashes.append((a1, a2))
+                    break
+
+        # 2) 仍未配对的【拼点群攻】，才单向拉住未配对的目标进入拼点
         for i, a1 in enumerate(actions):
             if i in used or not _can_clash(a1) or not a1.skill.clash_aoe:
                 continue
-
-            matched_idx = None
             for j, a2 in enumerate(actions):
                 if j == i or j in used or not _can_clash(a2):
                     continue
@@ -803,52 +828,16 @@ class CombatEngine:
                     continue
                 if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
                     continue
-                if a2.actor in a1.targets and a1.actor in a2.targets:
-                    matched_idx = j
+                if a2.actor in a1.targets:
+                    used.add(i)
+                    used.add(j)
+                    clashes.append((a1, a2))
                     break
 
-            if matched_idx is None:
-                for j, a2 in enumerate(actions):
-                    if j == i or j in used or not _can_clash(a2):
-                        continue
-                    if a1.actor is a2.actor:
-                        continue
-                    if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
-                        continue
-                    if a2.actor in a1.targets:
-                        matched_idx = j
-                        break
-
-            if matched_idx is not None:
-                used.add(i)
-                used.add(matched_idx)
-                clashes.append((a1, actions[matched_idx]))
-
-        # 2) 常规技能按双方互指配对拼点
-        for i, a1 in enumerate(actions):
-            if i in used or a1.cancelled or not a1.skill:
-                continue
-            matched = False
-            if _can_clash(a1):
-                for j in range(i + 1, len(actions)):
-                    if j in used:
-                        continue
-                    a2 = actions[j]
-                    if not _can_clash(a2):
-                        continue
-                    if a1.actor is a2.actor:
-                        continue
-                    if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
-                        continue
-                    if a2.actor in a1.targets and a1.actor in a2.targets:
-                        used.add(i)
-                        used.add(j)
-                        clashes.append((a1, a2))
-                        matched = True
-                        break
-            if not matched:
-                used.add(i)
-                unopposed.append(a1)
+        # 3) 剩余全部进入单方面行动
+        for i, act in enumerate(actions):
+            if i not in used and not act.cancelled and act.skill is not None:
+                unopposed.append(act)
 
         return clashes, unopposed
 
@@ -866,11 +855,6 @@ class CombatEngine:
     # 非拼点群攻结算（不视为拼点）
     # ------------------------------------------------------------------
     def _need_aoe_contest(self, aoe_actions: List[Action]) -> bool:
-        """
-        只有存在至少一对存在竞争关系的群攻时，才需要先行掷骰争夺释放权：
-        - 处于不同队伍（多方敌对同时放群攻）
-        - 或其中存在无差别群攻（无差别会波及队友，即使队友之间也要争夺）
-        """
         if len(aoe_actions) <= 1:
             return False
         if any(a.skill is not None and a.skill.indiscriminate for a in aoe_actions):
@@ -889,12 +873,6 @@ class CombatEngine:
         )
 
     def _resolve_aoe_contest(self, aoe_actions: List[Action]) -> List[Action]:
-        """
-        多方/无差别非拼点群攻竞争：
-        - 敌对队伍之间互相争夺释放权；
-        - 同队队友之间不互相争夺，除非其中存在无差别群攻。
-        返回所有最终获准释放的群攻 Action 列表。
-        """
         self.log(
             f"[群攻竞争] 场上共 {len(aoe_actions)} 个群攻技能存在释放冲突，先行掷骰决定释放权！"
         )
@@ -933,7 +911,6 @@ class CombatEngine:
                 tie_count=tie_count,
             )
 
-            # 1) 淘汰所有点数严格小于其竞争对手最大点数的群攻
             survivors: List[Action] = []
             eliminated: List[Tuple[Action, int, int]] = []
             for act, r in roll_list:
@@ -975,7 +952,6 @@ class CombatEngine:
             if not survivors:
                 return final_winners
 
-            # 2) 在存活者之间检查是否仍有竞争对手平局
             tied_contenders: List[Action] = []
             decided_winners: List[Action] = []
             for act in survivors:
@@ -1054,7 +1030,6 @@ class CombatEngine:
             aoe_act.extra["aoe_resolved"] = True
             return
 
-        # 1) 自身先掷出群攻技能点数（若已在群攻竞争中掷过，则直接沿用）
         if pre_rolled_aoe is not None:
             aoe_roll = floor_val(pre_rolled_aoe)
             self.log(f"  [群攻点数] {aoe_act.actor.name} 沿用先行掷出的 {aoe_roll} 点")
@@ -1063,7 +1038,6 @@ class CombatEngine:
             if not self.roll_handler:
                 self.log(f"  [群攻掷骰] {aoe_act.actor.name} 掷出 {aoe_roll} 点")
 
-        # 2) 其他玩家同时掷出各自技能点数并判定
         hit_targets: List[Character] = []
         deferred_unbreakables: List[Action] = []
 
@@ -1073,11 +1047,15 @@ class CombatEngine:
 
             active_actions = [
                 a for a in self.current_turn_selections
-                if a.actor is tgt and not a.cancelled and a.skill is not None
+                if a.actor is tgt
+                and a is not aoe_act
+                and not a.cancelled
+                and a.skill is not None
             ]
             contest_lost_actions = [
                 a for a in self.current_turn_selections
                 if a.actor is tgt
+                and a is not aoe_act
                 and a.extra.get("aoe_contest_lost")
                 and "aoe_contest_roll" in a.extra
             ]
@@ -1106,7 +1084,6 @@ class CombatEngine:
 
             rolls_for_tgt: List[int] = []
 
-            # 刚在群攻竞争中落败的群攻技能直接沿用先行点数
             for lost_act in contest_lost_actions:
                 raw_t_roll = floor_val(lost_act.extra["aoe_contest_roll"])
                 t_ctx = self.events.emit(
@@ -1131,7 +1108,6 @@ class CombatEngine:
                         f"虽未夺得释放权但抵御了本次群攻！"
                     )
 
-            # 其余未取消的技能（含普通技能、同队先释放的群攻或拼点群攻）正常掷点数对抗
             for t_act in active_actions:
                 u_act: Optional[Action] = None
                 raw_t_roll = self.roll_skill(t_act, clash_opponent=None)
@@ -1148,8 +1124,15 @@ class CombatEngine:
                 rolls_for_tgt.append(eff_roll)
 
                 if eff_roll < aoe_roll:
-                    already_fired = bool(t_act.extra.get("aoe_resolved"))
+                    already_fired = bool(
+                        t_act.extra.get("aoe_resolved") or t_act.extra.get("action_resolved")
+                    )
                     t_act.cancelled = True
+                    if not already_fired and (
+                        t_act.skill.has_unbreakable() or t_act.extra.get("force_unbreakable")
+                    ):
+                        u_act = self._build_unbreakable_action(aoe_act, t_act, from_aoe=True)
+
                     self.events.emit(
                         EventType.AOE_SUPPRESS,
                         self,
@@ -1158,33 +1141,31 @@ class CombatEngine:
                         target=tgt,
                         target_action=t_act,
                         target_roll=eff_roll,
+                        suppressed=not already_fired,
+                        unbreakable_action=u_act,
                     )
                     if already_fired:
                         self.log(
                             f"  [群攻判定] {tgt.name}[{t_act.skill.name}] 点数 {eff_roll} < {aoe_roll}，将受到群攻影响！"
                         )
-                    else:
-                        if t_act.skill.has_unbreakable() or t_act.extra.get("force_unbreakable"):
-                            u_act = self._build_unbreakable_action(aoe_act, t_act, from_aoe=True)
-
-                        if u_act is not None:
-                            assert u_act.skill is not None
-                            deferred_unbreakables.append(u_act)
-                            if u_act.skill.is_aoe:
-                                orig_tgts = ",".join(x.name for x in self._get_aoe_targets(u_act)) or "敌方全体"
-                                desc = f"以范围群攻({orig_tgts})生效"
-                            else:
-                                orig_tgts = ",".join(x.name for x in u_act.targets) or tgt.name
-                                desc = f"攻击原定目标({orig_tgts})"
-                            self.log(
-                                f"  [群攻判定] {tgt.name}[{t_act.skill.name}] 点数 {eff_roll} < {aoe_roll}，"
-                                f"触发【不可摧毁】碎币 [{u_act.skill.format_formula()}]，将在群攻结束后{desc}！"
-                            )
+                    elif u_act is not None:
+                        assert u_act.skill is not None
+                        deferred_unbreakables.append(u_act)
+                        if u_act.skill.is_aoe:
+                            orig_tgts = ",".join(x.name for x in self._get_aoe_targets(u_act)) or "敌方全体"
+                            desc = f"以范围群攻({orig_tgts})生效"
                         else:
-                            self.log(
-                                f"  [群攻判定] {tgt.name}[{t_act.skill.name}] 点数 {eff_roll} < {aoe_roll}，"
-                                f"本回合无法使用且将受到群攻影响！"
-                            )
+                            orig_tgts = ",".join(x.name for x in u_act.targets) or tgt.name
+                            desc = f"攻击原定目标({orig_tgts})"
+                        self.log(
+                            f"  [群攻判定] {tgt.name}[{t_act.skill.name}] 点数 {eff_roll} < {aoe_roll}，"
+                            f"触发【不可摧毁】碎币 [{u_act.skill.format_formula()}]，将在群攻结束后{desc}！"
+                        )
+                    else:
+                        self.log(
+                            f"  [群攻判定] {tgt.name}[{t_act.skill.name}] 点数 {eff_roll} < {aoe_roll}，"
+                            f"本回合无法使用且将受到群攻影响！"
+                        )
                 else:
                     self.log(
                         f"  [群攻判定] {tgt.name}[{t_act.skill.name}] 点数 {eff_roll} >= {aoe_roll}，抵御群攻！"
@@ -1193,7 +1174,6 @@ class CombatEngine:
             if max(rolls_for_tgt) < aoe_roll:
                 hit_targets.append(tgt)
 
-        # 3) 对所有点数小于群攻的玩家结算伤害、负面Buff与追加机制
         for tgt in hit_targets:
             if not aoe_act.actor.alive:
                 break
@@ -1220,8 +1200,8 @@ class CombatEngine:
             hit_targets=hit_targets,
         )
         aoe_act.extra["aoe_resolved"] = True
+        aoe_act.extra["action_resolved"] = True
 
-        # 4) 等群攻完整释放完毕后，存活的红币技能/红币群攻以碎币生效
         for deferred_act in deferred_unbreakables:
             if self.check_victory():
                 break
@@ -1238,7 +1218,6 @@ class CombatEngine:
         loser_act: Action,
         from_aoe: bool = False,
     ) -> Optional[Action]:
-        """评估拼点/抗群攻失败方是否保留不可摧毁技能/变动值，并兼容外部强行摧毁等钩子"""
         assert loser_act.skill is not None
         skill = loser_act.skill
 
@@ -1258,7 +1237,6 @@ class CombatEngine:
             broken_coins = [c.clone() for c in skill.coins if not c.unbreakable]
             survives = len(surviving_coins) > 0
 
-        # 红币群攻碎后默认依然保留范围攻击；单体红币则只朝原预选目标攻击
         default_keep_aoe = loser_act.extra.get("unbreakable_keep_aoe", skill.is_aoe)
 
         ctx = self.events.emit(
@@ -1369,6 +1347,8 @@ class CombatEngine:
                     self.log(
                         f"  [平局取消] 连续 {self.max_clash_ties} 次平局（点数 {r1}），直接取消双方技能！"
                     )
+                    act1.cancelled = True
+                    act2.cancelled = True
                     self.events.emit(EventType.CLASH_CANCEL_99, self, action1=act1, action2=act2)
                     return
 
@@ -1379,6 +1359,7 @@ class CombatEngine:
         destroyed = unbreakable_act is None
 
         if destroyed:
+            loser_act.cancelled = True
             self.log(
                 f"  [拼点结果] {winner_act.actor.name}({win_roll}) 胜出！ "
                 f"{loser_act.actor.name}({lose_roll}) 技能被摧毁"
@@ -1394,6 +1375,7 @@ class CombatEngine:
             self.events.emit(EventType.SKILL_DESTROYED, self, action=loser_act)
         else:
             assert unbreakable_act.skill is not None
+            loser_act.extra["action_resolved"] = True
             self.log(
                 f"  [拼点结果] {winner_act.actor.name}({win_roll}) 胜出！ "
                 f"{loser_act.actor.name}({lose_roll}) 触发【不可摧毁】，保留为 [{unbreakable_act.skill.format_formula()}]"
@@ -1416,10 +1398,8 @@ class CombatEngine:
             roll=win_roll,
         )
 
-        # 1) 胜者攻击结算（若胜者为拼点群攻，此处会先完整释放全范围群攻）
         self._execute_skill_hits(winner_act, win_roll)
 
-        # 2) 若败者仍存活且保留了不可摧毁技能，等胜者群攻放完后再以碎币生效
         if unbreakable_act is not None and unbreakable_act.actor.alive and not self.check_victory():
             self._resolve_unbreakable_attack(unbreakable_act)
 
@@ -1504,4 +1484,5 @@ class CombatEngine:
                 allow_breath=True,
             )
 
+        act.extra["action_resolved"] = True
         act.skill.on_attack_end(self, act)
