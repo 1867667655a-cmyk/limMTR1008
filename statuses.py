@@ -321,6 +321,44 @@ class CoinPowerDownStatus(StatusEffect):
             ctx.engine.set_status_stacks(self.owner, self.name, 0)
 
 
+class ParalyzeStatus(StatusEffect):
+    """麻痹 [减益]：本回合内使对应数量硬币（变动值）的威力固定为 0，每影响 1 枚消耗 1 层，回合结束清零"""
+
+    def __init__(self, stacks: int = 1):
+        super().__init__("麻痹", stacks=stacks, category="debuff")
+
+    def on_attach(self, engine: "CombatEngine", owner: Character) -> None:
+        super().on_attach(engine, owner)
+        # priority=100 确保在 硬币威力强化(0) 与 硬币威力弱化(50) 之后执行，将硬币威力固定为 0
+        self.bind(engine, EventType.BEFORE_SKILL_ROLL, self._on_before_roll, priority=100)
+        self.bind(engine, EventType.TURN_END, self._on_turn_end, priority=90)
+
+    def _on_before_roll(self, ctx: EventContext) -> None:
+        if ctx.data["actor"] is not self.owner or self.owner is None or self.stacks <= 0:
+            return
+
+        coins = ctx.data["roll_state"]["coins"]
+        if not coins:
+            return
+
+        consumed = min(self.stacks, len(coins))
+        for coin in coins[:consumed]:
+            coin.value = 0
+
+        remaining = self.stacks - consumed
+        skill = ctx.data.get("skill")
+        skill_name = f"[{skill.name}] " if skill else ""
+        ctx.engine.log(
+            f"  [麻痹] {self.owner.name} {skill_name}消耗 {consumed} 层麻痹（剩余 {remaining}），"
+            f"前 {consumed} 枚变动值威力固定为 0"
+        )
+        ctx.engine.set_status_stacks(self.owner, self.name, remaining)
+
+    def _on_turn_end(self, ctx: EventContext) -> None:
+        if self.owner:
+            ctx.engine.set_status_stacks(self.owner, self.name, 0)
+
+
 # ==============================================================================
 # 增益状态 (Buffs)
 # ==============================================================================
@@ -488,6 +526,7 @@ def register_default_statuses() -> None:
     register_status("易损", FragileStatus, "debuff")
     register_status("虚弱", WeakStatus, "debuff")
     register_status("硬币威力弱化", CoinPowerDownStatus, "debuff")
+    register_status("麻痹", ParalyzeStatus, "debuff")
 
     # 增益 (buff)
     register_status("充能", ChargeStatus, "buff")
