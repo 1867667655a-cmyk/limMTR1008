@@ -2,6 +2,7 @@ from .bgm import AudioBackend, BGMManager, BGMTrack, NullAudioBackend
 from .combat import CombatEngine
 from .events import EventBus, EventContext, EventType
 from .input_utils import InteractiveRollHandler
+from .bgm import AudioBackend, BGMManager, BGMTrack, NullAudioBackend, PygameAudioBackend
 from .loader import (
     load_character_from_file,
     load_characters_from_dir,
