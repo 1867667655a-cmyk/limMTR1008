@@ -22,3 +22,7 @@ fw0+7做的群攻有bug,现已修复,更新了engine/combat.py、main.py
 
 2026/11/26 22:46
 更新BGM播放,新增文件夹bgm,更改了engine\combat.py、engine\bgm.py、engine\bgm.py
+可在角色内定义bgm = BGMTrack(
+        track_id="",
+        title="",
+以调用
