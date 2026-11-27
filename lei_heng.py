@@ -620,6 +620,7 @@ class CommanderSpecialSkill(CommanderSkillBase):
 
     def _process_first_use(self, engine, actor, action, rec) -> None:
         # 至多消耗30层极力，每消耗10层最终威力+2
+        grant_slash_stance(engine, action.actor, 3)
         jili = actor.get_status_stacks("极力")
         consume_jili = min(30, jili)
         if consume_jili > 0:
@@ -650,7 +651,6 @@ class CommanderSpecialSkill(CommanderSkillBase):
         self._apply_burn_and_triggers(engine, action.actor, target, base_burn=10, rec=rec)
 
     def on_attack_end(self, engine, action: Action) -> None:
-        grant_slash_stance(engine, action.actor, 3)
         grant_fierce_ammo_up_to(engine, action.actor, 9, refill_mode=False)
 
 
@@ -684,13 +684,19 @@ class CommanderStrongSpecialSkill(CommanderSkillBase):
         # 剩余虎标弹大于3枚 -> 伤害+50%
         if rec["initial_ammo"] > 3:
             rec["damage_bonus_pct"] += 50
+        total_field_burn = sum(
+            c.get_status_stacks("烧伤") for c in engine.get_living_characters()
+        )
+        burn_power_bonus = min(15, (total_field_burn // 4) * 2)
+        rec["skill_power_bonus"] += burn_power_bonus
+        rec["damage_bonus_pct"] += burn_power_bonus
 
         # 5条单发消耗词条
         single_clauses = [
-            (4, 1, 0),
-            (6, 1, 0),
-            (6, 1, 0),
-            (6, 1, 0),
+            (4, 1, 5),
+            (6, 1, 10),
+            (6, 1, 15),
+            (6, 1, 20),
             (10, 1, 25),
         ]
         for burn_add, pwr_add, dmg_add in single_clauses:
@@ -877,7 +883,7 @@ class CommanderCorePassive(Passive):
             # 延后保证首次获得极力的台词/丢弹/BGM触发
             owner.custom_state["spoken_jili"] = True
             owner.custom_state["has_jili"] = True
-            speak(ctx.engine, owner, "嗬。你们要动真格的，那我可就来劲了。")
+            speak(ctx.engine, owner, "嚯。你们要动真格的，那我可就来劲了。")
             owner.custom_state["fierce_support_active"] = True
             discard_all_ammo(ctx.engine, owner)
             grant_fierce_ammo_up_to(ctx.engine, owner, 18, refill_mode=False)
