@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from engine import (
     STATUS_CATEGORIES,
     Action,
+    BGMTrack,
     Character,
     Coin,
     DamageContext,
@@ -103,9 +104,11 @@ class EnemyBurnoutStatus(StatusEffect):
             return
         status_name: str = ctx.data["status_name"]
         status_obj: Optional[StatusEffect] = ctx.data.get("status_obj")
+        extra_cat = ctx.data.get("extra", {}).get("category")
         is_buff = (
             (status_obj.is_buff if status_obj is not None else False)
             or (STATUS_CATEGORIES.get(status_name) == "buff")
+            or (extra_cat == "buff")
         )
         if is_buff:
             ctx.cancelled = True
@@ -370,6 +373,11 @@ class ReverseCursedTechniqueSkill(Skill):
         if passive:
             passive.execute_rct(engine, actor)
 
+        if not actor.alive:
+            action.skill = None
+            action.targets = []
+            return
+
         if self in actor.available_skills:
             actor.available_skills.remove(self)
 
@@ -508,7 +516,12 @@ class SukunaCorePassive(Passive):
         self._nullified_enemy_actors: Set[int] = set()
 
     def domain_active(self) -> bool:
-        return self.domain_turns_left > 0 and not self.burnout_active
+        return bool(
+            self.owner
+            and self.owner.alive
+            and self.domain_turns_left > 0
+            and not self.burnout_active
+        )
 
     def technique_active(self) -> bool:
         return not self.burnout_active
@@ -568,6 +581,27 @@ class SukunaCorePassive(Passive):
         best = max(pool, key=_max_roll_key)
         return best.clone()
 
+    def _activate_aizo_bgm(self, engine) -> None:
+        owner = self.owner
+        if not owner or not owner.alive:
+            return
+        track = None
+        for tr in getattr(owner, "bgm_tracks", []):
+            if tr.extra_data.get("aizo_theme") or "aizo" in tr.track_id.lower():
+                track = tr
+                break
+        if track is None:
+            track = BGMTrack(
+                track_id=f"{owner.char_id}_aizo",
+                title="aizo",
+                owner=owner,
+                loop=True,
+                extra_data={"aizo_theme": True},
+            )
+            owner.bgm_tracks.append(track)
+            engine.bgm.register_track(track, owner=owner)
+        track.activate(engine, force_debut=True)
+
     def _flush_pending_fuga_clashes(self, engine) -> None:
         owner = self.owner
         if not owner or not owner.alive or not self._pending_fuga_clashes:
@@ -594,6 +628,7 @@ class SukunaCorePassive(Passive):
             engine.log(
                 f"  [★ 好不容易来了点兴致就和你玩玩吧 ★] {opp.name} 已连续拼输 10 次！"
             )
+            self._activate_aizo_bgm(engine)
             engine.log(
                 f"  [{owner.name}] 「不过我难得来了点兴致，那就用你最擅长的招式和你打」"
             )
@@ -628,7 +663,12 @@ class SukunaCorePassive(Passive):
             engine._resolve_clash(fuga_act, enemy_act)
 
     def _on_domain_ended(self, engine) -> None:
-        """领域结束或破碎时：清除场上落花之情，并使曾领域对拼落败的敌方进入术式熔断"""
+        """领域结束或破碎时：恢复手牌红币状态，清除场上落花之情，并使曾领域对拼落败的敌方进入术式熔断"""
+        if self.owner:
+            for sk in self.owner.available_skills:
+                if not isinstance(sk, ReverseCursedTechniqueSkill):
+                    sk.unbreakable = False
+
         for c in list(engine.characters):
             if c.get_status("落花之情") is not None:
                 engine.remove_status(c, "落花之情")
@@ -932,6 +972,12 @@ class SukunaCorePassive(Passive):
             owner.available_skills.remove(self._temp_rct_skill)
         self._temp_rct_skill = None
 
+        if not owner.alive:
+            if self.domain_turns_left > 0:
+                self.domain_turns_left = 0
+                self._on_domain_ended(engine)
+            return
+
         if self.domain_turns_left > 0 and not self.burnout_active:
             self.domain_turns_left -= 1
             if self.domain_turns_left == 0:
@@ -1013,8 +1059,8 @@ class SukunaCorePassive(Passive):
                     sk.is_aoe = False
                     sk.target_type = "single_enemy"
 
-            if self.domain_active() and not isinstance(sk, ReverseCursedTechniqueSkill):
-                sk.unbreakable = True
+            if not isinstance(sk, ReverseCursedTechniqueSkill):
+                sk.unbreakable = self.domain_active()
 
         if self.rct_count > 0 and not any(
             isinstance(s, ReverseCursedTechniqueSkill) for s in owner.available_skills
@@ -2057,10 +2103,12 @@ class SukunaCorePassive(Passive):
         source: Optional[Character] = ctx.data.get("source")
         status_name: str = ctx.data["status_name"]
         status_obj: Optional[StatusEffect] = ctx.data.get("status_obj")
+        extra_cat = ctx.data.get("extra", {}).get("category")
 
         is_debuff = (
             (status_obj.is_debuff if status_obj is not None else False)
             or (STATUS_CATEGORIES.get(status_name) == "debuff")
+            or (extra_cat == "debuff")
         )
 
         # 1) 敌方被宿傩判定为本技能无效（适应一15层）：阻止对宿傩施加负面效果
@@ -2219,12 +2267,20 @@ class SukunaCorePassive(Passive):
 
 
 def create_character(team: str = "P1", **kwargs) -> Character:
+    aizo_track = BGMTrack(
+        track_id=f"sukuna_aizo_{team}",
+        title="aizo",
+        file_path=None,  # 后续若接入 pygame 等真音频后端，可填音频文件路径如 "bgm/aizo.mp3"
+        loop=True,
+        extra_data={"aizo_theme": True},
+    )
     char = Character(
         char_id=f"sukuna_{team}",
         name="两面宿傩",
         team=team,
         max_hp=SUKUNA_MAX_HP,
         passives=[SukunaCorePassive()],
+        bgm_tracks=[aizo_track],
     )
     char.set_standard_skills(SukunaSkill1(), SukunaSkill2(), SukunaSkill3())
     return char
