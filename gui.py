@@ -871,9 +871,12 @@ class GameWindow:
                 f"{t.name}[队友]" if (t.team == act.actor.team and t is not act.actor) else t.name
                 for t in act.targets
             ) or "-"
+            spd = engine.get_speed(act.actor) if hasattr(engine, "get_speed") else "?"
             pct = engine.format_hp_percent(act.actor) if hasattr(engine, "format_hp_percent") else ""
             itag = "[已被拦截]" if act.extra.get("intercepted_by") else ""
-            prev_summary.append(f"[{act.actor.team}] {act.actor.name}({pct}): {s_name} → {tgts}{itag}")
+            prev_summary.append(
+                f"[{act.actor.team}] {act.actor.name}(速度:{spd} | {pct}): {s_name} → {tgts}{itag}"
+            )
 
         self.post_event(
             "request_action",
@@ -1034,9 +1037,17 @@ class GameWindow:
             tk.Label(
                 hdr, text=name_txt, bg=bg, fg=name_fg, font=(FONT_NAME, 11, "bold")
             ).pack(side=tk.LEFT)
+
             tk.Label(
                 hdr, text=f"余牌: {len(c.available_skills)}", bg=bg, fg=FG_MUTED, font=(FONT_NAME, 9)
             ).pack(side=tk.RIGHT)
+
+            if c.alive and hasattr(eng, "get_speed"):
+                spd_val = eng.get_speed(c)
+                tk.Label(
+                    hdr, text=f"速度:{spd_val}", bg="#2C2716", fg=ACCENT_GOLD,
+                    padx=6, pady=1, font=(FONT_NAME, 9, "bold")
+                ).pack(side=tk.RIGHT, padx=(0, 8))
 
             hp_pct = max(0, min(100, int((c.hp / max(1, c.max_hp)) * 100)))
             hp_pct_str = eng.format_hp_percent(c) if hasattr(eng, "format_hp_percent") else f"{hp_pct}%"
@@ -1231,11 +1242,12 @@ class GameWindow:
         prev_summary: List[str] = data["prev_summary"]
 
         eng = self.engine
+        spd = eng.get_speed(char) if (eng and hasattr(eng, "get_speed")) else "?"
         pct = eng.format_hp_percent(char) if (eng and hasattr(eng, "format_hp_percent")) else ""
         team_color = ACCENT_BLUE if char.team == "P1" else ACCENT_RED
         self.phase_lbl.config(text=f"[状态: 等待 {char.name} 选技]", fg=team_color)
         self.action_title_lbl.config(
-            text=f"轮到 [{char.team}] {char.name} (速度:{pct}) 选择技能 (槽位 {slot_idx + 1})",
+            text=f"轮到 [{char.team}] {char.name} (速度:{spd} | {pct}) 选择技能 (槽位 {slot_idx + 1})",
             fg=team_color,
         )
         if prev_summary:
@@ -1352,12 +1364,13 @@ class GameWindow:
             else:
                 side, fg = "敌方", ACCENT_RED
 
+            spd = eng.get_speed(tgt) if (eng and hasattr(eng, "get_speed")) else "?"
             pct = eng.format_hp_percent(tgt) if (eng and hasattr(eng, "format_hp_percent")) else ""
             st_txt = ", ".join(f"{k}:{v.stacks}" for k, v in tgt.statuses.items())
             st_line = f"\n状态: {st_txt}" if st_txt else ""
             btn = tk.Button(
                 self.dock_inner,
-                text=f"[{side}] {tgt.name} (速度:{pct})\nHP: {tgt.hp}/{tgt.max_hp}{st_line}",
+                text=f"[{side}] {tgt.name} (速度:{spd} | {pct})\nHP: {tgt.hp}/{tgt.max_hp}{st_line}",
                 command=lambda t=tgt: self._on_target_chosen(actor, skill, t, candidates),
                 bg=BG_CARD_ALT, fg=fg,
                 activebackground=ACCENT_BLUE, activeforeground="#FFF",
@@ -1402,10 +1415,10 @@ class GameWindow:
         eng = self.engine
         assert eng is not None
 
-        my_pct = eng.format_hp_percent(actor)
-        tgt_pct = eng.format_hp_percent(target)
+        my_spd = eng.get_speed(actor)
+        tgt_spd = eng.get_speed(target)
         self.action_info_lbl.config(
-            text=f"[速度压制] {actor.name}({my_pct}) 比 {target.name}({tgt_pct}) 更快！请选择攻击方式：",
+            text=f"[速度压制] {actor.name}(速度:{my_spd}) 比 {target.name}(速度:{tgt_spd}) 更快！请选择攻击方式：",
             fg=ACCENT_GOLD,
         )
 
