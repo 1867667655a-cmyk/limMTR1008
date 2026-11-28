@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from collections import deque
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
@@ -497,8 +498,74 @@ class CombatEngine:
             self.action_queue.append(action)
 
     # ------------------------------------------------------------------
-    # 选技顺序逻辑
+    # 百分比血量速度与选技/拦截逻辑
     # ------------------------------------------------------------------
+    @staticmethod
+    def get_hp_ratio(char: Character) -> Fraction:
+        if char.max_hp <= 0:
+            return Fraction(0, 1)
+        return Fraction(max(0, char.hp), char.max_hp)
+
+    @staticmethod
+    def format_hp_percent(char: Character) -> str:
+        if char.max_hp <= 0:
+            return "0.0%"
+        return f"{(max(0, char.hp) * 100) / char.max_hp:.1f}%"
+
+    def is_faster_than(self, actor: Character, other: Character) -> bool:
+        return self.get_hp_ratio(actor) > self.get_hp_ratio(other)
+
+    def get_interceptable_actions(
+        self,
+        attacker: Character,
+        skill: Optional[Skill],
+        target: Character,
+        previous_selections: Optional[List[Action]] = None,
+    ) -> List[Action]:
+        if (
+            skill is None
+            or not skill.clashable
+            or (skill.is_aoe and not skill.clash_aoe)
+            or attacker is target
+            or (not self.allow_ally_clash and attacker.team == target.team)
+            or not self.is_faster_than(attacker, target)
+        ):
+            return []
+
+        pool = (
+            self.current_turn_selections
+            if previous_selections is None
+            else previous_selections
+        )
+        result: List[Action] = []
+        for act in pool:
+            if (
+                act.actor is target
+                and not act.cancelled
+                and act.skill is not None
+                and act.clashable
+                and act.skill.clashable
+                and (not act.skill.is_aoe or act.skill.clash_aoe)
+                and act.extra.get("intercepted_by") is None
+            ):
+                result.append(act)
+        return result
+
+    def configure_interception(
+        self,
+        action: Action,
+        intercept_action: Optional[Action],
+        interceptable_pool: Optional[List[Action]] = None,
+    ) -> None:
+        if intercept_action is not None:
+            action.extra["intercept_target_action"] = intercept_action
+            intercept_action.extra["intercepted_by"] = action
+        elif interceptable_pool:
+            skip_ids = set(action.extra.get("unopposed_skip_actions", ()))
+            for s_act in interceptable_pool:
+                skip_ids.add(id(s_act))
+            action.extra["unopposed_skip_actions"] = skip_ids
+
     def compute_selection_order(self) -> List[Tuple[Character, int]]:
         living = self.get_living_characters()
         all_slots: List[Tuple[Character, int]] = []
@@ -506,14 +573,15 @@ class CombatEngine:
             for slot_idx in range(c.action_slots):
                 all_slots.append((c, slot_idx))
 
-        hp_buckets: Dict[int, List[Tuple[Character, int]]] = {}
+        ratio_buckets: Dict[Fraction, List[Tuple[Character, int]]] = {}
         for item in all_slots:
-            hp_buckets.setdefault(item[0].hp, []).append(item)
+            ratio_buckets.setdefault(self.get_hp_ratio(item[0]), []).append(item)
 
         ordered: List[Tuple[Character, int]] = []
         starter = self._tie_turn_starter
-        for hp_val in sorted(hp_buckets.keys(), reverse=True):
-            bucket = hp_buckets[hp_val]
+        # 百分比血量越低速度越慢、越先动；百分比血量越高速度越快、越后动（可拦截慢速技能）
+        for ratio_val in sorted(ratio_buckets.keys(), reverse=False):
+            bucket = ratio_buckets[ratio_val]
             teams_in_bucket: Dict[str, List[Tuple[Character, int]]] = {}
             for item in bucket:
                 teams_in_bucket.setdefault(item[0].team, []).append(item)
@@ -556,7 +624,31 @@ class CombatEngine:
         else:
             targets = [self.rng.choice(pool)]
 
-        return Action(actor=char, skill=skill, targets=targets)
+        act = Action(actor=char, skill=skill, targets=targets)
+
+        if len(targets) == 1:
+            interceptables = self.get_interceptable_actions(
+                char, skill, targets[0], previous_selections
+            )
+            if interceptables:
+                ai_max = floor_val(skill.base_power) + sum(
+                    max(0, floor_val(c.value)) for c in skill.coins
+                )
+                preferred = sorted(
+                    interceptables,
+                    key=lambda a: 0 if (char in a.targets or any(t.team == char.team for t in a.targets)) else 1,
+                )
+                cand = preferred[0]
+                assert cand.skill is not None
+                cand_avg = cand.skill.base_power + sum(
+                    c.value * c.probability for c in cand.skill.coins
+                )
+                if ai_max >= cand_avg or (char in cand.targets and self.rng.random() < 0.75):
+                    self.configure_interception(act, cand, interceptables)
+                else:
+                    self.configure_interception(act, None, interceptables)
+
+        return act
 
     # ------------------------------------------------------------------
     # 主流程控制
@@ -578,7 +670,7 @@ class CombatEngine:
                 else ""
             )
             self.log(
-                f"  [{c.team}] {c.name} HP:{c.hp}/{c.max_hp} "
+                f"  [{c.team}] {c.name} HP:{c.hp}/{c.max_hp} ({self.format_hp_percent(c)}) "
                 f"(余牌:{len(c.available_skills)}){st_str}"
             )
             p_str = c.format_triggered_passives(self)
@@ -688,8 +780,17 @@ class CombatEngine:
                     f"{t.name}[队友]" if (t.team == char.team and t is not char) else t.name
                     for t in action.targets
                 )
+                if action.extra.get("intercept_target_action") is not None:
+                    i_act = action.extra["intercept_target_action"]
+                    i_sk = i_act.skill.name if i_act.skill else "?"
+                    mode_tag = f" [拦截拼点 -> {i_act.actor.name}({i_sk})]"
+                elif action.extra.get("unopposed_skip_actions"):
+                    mode_tag = " [单方面攻击(不换目标)]"
+                else:
+                    mode_tag = ""
                 self.log(
-                    f"[选技] {char.name} 选择 [{action.skill.name}({action.skill.format_formula()})] -> {tgt_names}"
+                    f"[选技] {char.name}({self.format_hp_percent(char)}) 选择 "
+                    f"[{action.skill.name}({action.skill.format_formula()})] -> {tgt_names}{mode_tag}"
                 )
             else:
                 self.log(f"[选技] {char.name} 无可用技能（本回合只能挨打）")
@@ -784,6 +885,7 @@ class CombatEngine:
         used = set()
         clashes: List[Tuple[Action, Action]] = []
         unopposed: List[Action] = []
+        idx_map: Dict[int, int] = {id(act): idx for idx, act in enumerate(actions)}
 
         def _can_clash(act: Action) -> bool:
             return (
@@ -794,7 +896,41 @@ class CombatEngine:
                 and (not act.skill.is_aoe or act.skill.clash_aoe)
             )
 
-        # 1) 先匹配所有【双方互指】的拼点（优先让 clash_aoe 的互指先匹配）
+        def _skip_pair(a1: Action, a2: Action) -> bool:
+            return (
+                id(a2) in a1.extra.get("unopposed_skip_actions", ())
+                or id(a1) in a2.extra.get("unopposed_skip_actions", ())
+            )
+
+        # 0) 优先处理高速单位明确选择的【拦截拼点】（从最快到最慢匹配）
+        for i in reversed(range(len(actions))):
+            if i in used or not _can_clash(actions[i]):
+                continue
+            a1 = actions[i]
+            s_act: Optional[Action] = a1.extra.get("intercept_target_action")
+            if s_act is None:
+                continue
+            j = idx_map.get(id(s_act))
+            if j is None or j == i or j in used or not _can_clash(s_act):
+                continue
+            if a1.actor is s_act.actor:
+                continue
+            if not self.allow_ally_clash and a1.actor.team == s_act.actor.team:
+                continue
+
+            used.add(i)
+            used.add(j)
+            if not s_act.skill.is_aoe and a1.actor not in s_act.targets:
+                orig_names = ",".join(t.name for t in s_act.targets) or "-"
+                s_act.extra["original_targets"] = list(s_act.targets)
+                s_act.targets = [a1.actor]
+                self.log(
+                    f"[拦截拼点] {a1.actor.name} 拦截了 {s_act.actor.name} 的"
+                    f"【{s_act.skill.name}】(原目标 {orig_names} -> 改为 {a1.actor.name})！"
+                )
+            clashes.append((a1, s_act))
+
+        # 1) 匹配所有【双方互指】的拼点（优先 clash_aoe，并跳过主动选择单方面攻击的组合）
         indices = sorted(
             range(len(actions)),
             key=lambda idx: 0 if (actions[idx].skill and actions[idx].skill.clash_aoe) else 1,
@@ -810,6 +946,8 @@ class CombatEngine:
                 if a1.actor is a2.actor:
                     continue
                 if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
+                    continue
+                if _skip_pair(a1, a2):
                     continue
                 if a2.actor in a1.targets and a1.actor in a2.targets:
                     used.add(i)
@@ -827,6 +965,8 @@ class CombatEngine:
                 if a1.actor is a2.actor:
                     continue
                 if not self.allow_ally_clash and a1.actor.team == a2.actor.team:
+                    continue
+                if id(a2) in a1.extra.get("unopposed_skip_actions", ()):
                     continue
                 if a2.actor in a1.targets:
                     used.add(i)
