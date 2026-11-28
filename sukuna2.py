@@ -19,7 +19,7 @@ from engine import (
     floor_val,
 )
 
-SUKUNA_MAX_HP = 1600
+SUKUNA_MAX_HP = 100
 MAX_EXCITEMENT = 10  # [待确认] 兴致上限，如需其他数值可直接修改此常量
 AIZO_AUDIO_PATH = r"C:\Users\jntmQ\Desktop\AIZO.mp3"
 AIZO_DURATION_SEC = 215.0
