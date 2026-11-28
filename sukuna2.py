@@ -19,8 +19,10 @@ from engine import (
     floor_val,
 )
 
-SUKUNA_MAX_HP = 600
+SUKUNA_MAX_HP = 1600
 MAX_EXCITEMENT = 10  # [待确认] 兴致上限，如需其他数值可直接修改此常量
+AIZO_AUDIO_PATH = r"C:\Users\jntmQ\Desktop\AIZO.mp3"
+AIZO_DURATION_SEC = 215.0
 
 
 def _get_sukuna_passive(char: Character) -> Optional["SukunaCorePassive"]:
@@ -79,7 +81,6 @@ class EnemyBurnoutStatus(StatusEffect):
     def on_attach(self, engine, owner: Character) -> None:
         super().on_attach(engine, owner)
 
-        # 暂时挂起并解除当前身上所有正面状态效果
         suspended_names: List[str] = []
         for st_name, st_obj in list(owner.statuses.items()):
             if st_obj is not self and st_obj.is_buff and st_obj.stacks > 0:
@@ -342,6 +343,12 @@ class WorldCuttingSlashSkill(Skill):
         if target.hp <= 0 and target.alive:
             target.alive = False
             engine.log(f"  [空间斩] 无视锁血，直接斩杀 {target.name}！")
+            target_passive = _get_sukuna_passive(target)
+            if target_passive:
+                if target_passive.domain_turns_left > 0:
+                    target_passive.domain_turns_left = 0
+                    target_passive._on_domain_ended(engine)
+                target_passive._kill_body_parts(engine)
             if (
                 target.team != action.actor.team
                 and not dmg_ctx.extra.get("wcs_kill_spoken")
@@ -366,6 +373,16 @@ class ReverseCursedTechniqueSkill(Skill):
             clashable=False,
             tags={"sukuna_rct"},
         )
+
+    def can_use(self, engine, actor: Character) -> bool:
+        p = _get_sukuna_passive(actor)
+        if not p or p.rct_count <= 0:
+            return False
+        has_damaged_part = p.true_form_triggered and any(
+            part is not None and (not part.alive or part.hp < part.max_hp)
+            for part in (p.mouth_part, p.arms_part)
+        )
+        return p.burnout_active or actor.hp < actor.max_hp or has_damaged_part
 
     def on_select(self, engine, action: Action) -> None:
         actor = action.actor
@@ -428,7 +445,7 @@ class ShenWuJieSkill(Skill):
 
 
 # ==============================================================================
-# 「双嘴」与「四手」实体部位（单纯无法行动的部位）
+# 「双嘴」与「四手」实体部位（附着于宿傩身上的部位）
 # ==============================================================================
 
 class SukunaBodyPart(Character):
@@ -513,7 +530,6 @@ class SukunaCorePassive(Passive):
         self._temp_rct_skill: Optional[ReverseCursedTechniqueSkill] = None
         self._blocked_unbreakable_actions: Set[int] = set()
         self._enemy_active_skill_vs_sukuna: Dict[int, str] = {}
-        self._nullified_enemy_actors: Set[int] = set()
 
     def domain_active(self) -> bool:
         return bool(
@@ -528,6 +544,31 @@ class SukunaCorePassive(Passive):
 
     def _is_body_part(self, char: Optional[Character]) -> bool:
         return char is not None and (char is self.mouth_part or char is self.arms_part)
+
+    def _get_living_parts(self) -> List[SukunaBodyPart]:
+        parts: List[SukunaBodyPart] = []
+        if self.mouth_part and self.mouth_part.alive:
+            parts.append(self.mouth_part)
+        if self.arms_part and self.arms_part.alive:
+            parts.append(self.arms_part)
+        return parts
+
+    def _is_manual_actor(self, engine, actor: Character) -> bool:
+        if actor.ai_selector is not None:
+            return False
+        sel = engine.manual_selector
+        if sel is None:
+            return False
+        if getattr(sel, "__name__", "") == "p1_manual_p2_ai" and actor.team != "P1":
+            return False
+        return True
+
+    def _kill_body_parts(self, engine) -> None:
+        for part in (self.mouth_part, self.arms_part):
+            if part is not None and part.alive:
+                part.hp = 0
+                part.alive = False
+                engine.log(f"  [躯体崩解] {self.owner.name} 阵亡，【{part.name}】随之消散！")
 
     def _add_excitement(self, amount: int) -> int:
         if amount <= 0 or self.excitement >= MAX_EXCITEMENT:
@@ -581,10 +622,14 @@ class SukunaCorePassive(Passive):
         best = max(pool, key=_max_roll_key)
         return best.clone()
 
-    def _activate_aizo_bgm(self, engine) -> None:
+    def _activate_aizo_bgm(
+        self, engine, reason: str = "好不容易来了点兴致就和你玩玩吧"
+    ) -> None:
         owner = self.owner
         if not owner or not owner.alive:
             return
+        owner.custom_state["aizo_active"] = True
+
         track = None
         for tr in getattr(owner, "bgm_tracks", []):
             if tr.extra_data.get("aizo_theme") or "aizo" in tr.track_id.lower():
@@ -593,14 +638,18 @@ class SukunaCorePassive(Passive):
         if track is None:
             track = BGMTrack(
                 track_id=f"{owner.char_id}_aizo",
-                title="aizo",
-                owner=owner,
-                loop=True,
+                title="AIZO",
+                file_path=AIZO_AUDIO_PATH,
+                duration_sec=AIZO_DURATION_SEC,
+                condition=lambda eng, tr: bool(tr.owner and tr.owner.custom_state.get("aizo_active")),
+                stop_on_owner_death=True,
                 extra_data={"aizo_theme": True},
             )
             owner.bgm_tracks.append(track)
             engine.bgm.register_track(track, owner=owner)
-        track.activate(engine, force_debut=True)
+
+        track.debut_turn = max(1, engine.global_turn)
+        engine.bgm.evaluate(reason=reason)
 
     def _flush_pending_fuga_clashes(self, engine) -> None:
         owner = self.owner
@@ -628,7 +677,7 @@ class SukunaCorePassive(Passive):
             engine.log(
                 f"  [★ 好不容易来了点兴致就和你玩玩吧 ★] {opp.name} 已连续拼输 10 次！"
             )
-            self._activate_aizo_bgm(engine)
+            self._activate_aizo_bgm(engine, reason="好不容易来了点兴致就和你玩玩吧")
             engine.log(
                 f"  [{owner.name}] 「不过我难得来了点兴致，那就用你最擅长的招式和你打」"
             )
@@ -733,6 +782,8 @@ class SukunaCorePassive(Passive):
         )
         enemy_aoe_act.extra["is_domain_clash_enemy"] = True
 
+        self._activate_aizo_bgm(engine, reason="领域对拼")
+
         engine.log(
             f"  [★ 领域对拼 ★] {opp.name} 在【伏魔御厨子】内展开群攻【{orig_skill_name}】，"
             f"{owner.name} 使用【「灶」】展开领域对拼！"
@@ -754,22 +805,59 @@ class SukunaCorePassive(Passive):
             engine.bgm.evaluate(reason="宿傩回复生命")
         return gained
 
+    def _heal_lowest_body_part(self, engine, heal_amount: int) -> None:
+        if not self.true_form_triggered or heal_amount <= 0:
+            return
+        parts = [p for p in (self.mouth_part, self.arms_part) if p is not None]
+        if not parts:
+            return
+
+        target_parts = [p for p in parts if not p.alive or p.hp < p.max_hp]
+        if not target_parts:
+            return
+
+        lowest = min(target_parts, key=lambda p: (p.hp, 0 if p is self.mouth_part else 1))
+        was_dead = not lowest.alive or lowest.hp <= 0
+        before_hp = max(0, lowest.hp)
+        lowest.hp = min(lowest.max_hp, before_hp + heal_amount)
+        gained = lowest.hp - before_hp
+
+        if was_dead and lowest.hp > 0:
+            lowest.alive = True
+            engine.log(
+                f"  [反转术式] 【{lowest.name}】复活并回复 {gained} 点生命值 "
+                f"(HP: {lowest.hp}/{lowest.max_hp})"
+            )
+        elif gained > 0:
+            engine.log(
+                f"  [反转术式] 【{lowest.name}】回复 {gained} 点生命值 "
+                f"(HP: {lowest.hp}/{lowest.max_hp})"
+            )
+
     def execute_rct(self, engine, owner: Character) -> None:
+        if not owner.alive:
+            return
         if self.rct_count > 0:
             self.rct_count -= 1
         five_pct = max(1, floor_mul(owner.max_hp, 5, 100))
 
         if self.burnout_active:
-            self.burnout_active = False
-            owner.hp = max(0, owner.hp - five_pct)
-            engine.log(
-                f"  [反转术式] {owner.name} 处于术式熔断，抵消术式熔断但失去 {five_pct} HP (HP: {owner.hp}/{owner.max_hp})"
-            )
-            engine._check_death(owner, killer=None)
-            if owner.alive:
+            if (owner.hp - five_pct) > 0:
+                self.burnout_active = False
+                owner.hp = owner.hp - five_pct
+                engine.log(
+                    f"  [反转术式] {owner.name} 处于术式熔断，抵消术式熔断但失去 {five_pct} HP (HP: {owner.hp}/{owner.max_hp})"
+                )
                 self._try_activate_domain(engine)
-        else:
-            self._apply_healing(engine, five_pct, reason="反转术式")
+                return
+
+            engine.log(
+                f"  [反转术式] {owner.name} 当前生命（{owner.hp}）若扣除 {five_pct} HP 将阵亡或进入锁血，切换至正常回血！"
+            )
+
+        self._apply_healing(engine, five_pct, reason="反转术式")
+        final_part_heal = floor_mul(five_pct, self.black_flash_mult_pct, 100)
+        self._heal_lowest_body_part(engine, final_part_heal)
 
     def on_register(self, engine, owner: Character) -> None:
         super().on_register(engine, owner)
@@ -810,7 +898,6 @@ class SukunaCorePassive(Passive):
 
         self.bind(engine, EventType.STATUS_APPLY, self._on_status_apply, priority=20)
         self.bind(engine, EventType.CHARACTER_DEATH, self._on_character_death, priority=-40)
-        self.bind(engine, EventType.CHARACTER_DEATH, self._on_part_death_notify, priority=100)
 
     # ------------------------------------------------------------------
     # 生命周期与领域 / 熔断 / 魔虚罗检查
@@ -831,7 +918,6 @@ class SukunaCorePassive(Passive):
         if not owner or not owner.alive:
             return
 
-        # 嵌合兽带有（术式）标记：术式熔断期间不会回血
         if self.technique_active() and not self.chimera_heal_disabled:
             heal_amt = max(1, floor_mul(owner.max_hp, 5, 100))
             self._apply_healing(engine, heal_amt, reason="十种影法术·嵌合兽")
@@ -896,6 +982,11 @@ class SukunaCorePassive(Passive):
 
         self._check_mahoraga_unlock(engine)
 
+        living_parts = self._get_living_parts()
+        if self.true_form_triggered and living_parts:
+            p_str = " | ".join(f"{p.name}: {p.hp}/{p.max_hp} HP" for p in living_parts)
+            engine.log(f"  [为咒术而生的肉体] 当前部位：{p_str}")
+
         self.cursed_energy += 1
         engine.log(f"  [咒术师] {owner.name} 回合开始咒力 +1（当前: {self.cursed_energy}）")
 
@@ -935,7 +1026,6 @@ class SukunaCorePassive(Passive):
                 for c in engine.get_living_characters():
                     if c is owner or self._is_body_part(c):
                         continue
-                    # 持有「落花之情」时：流血层数正常减半扣层，领域不再还原或保底
                     if c.get_status("落花之情") is not None:
                         continue
                     target_bleed = max(8, self._bleed_snapshot.get(id(c), 0))
@@ -966,7 +1056,6 @@ class SukunaCorePassive(Passive):
             return
 
         self._enemy_active_skill_vs_sukuna.clear()
-        self._nullified_enemy_actors.clear()
 
         if self._temp_rct_skill and self._temp_rct_skill in owner.available_skills:
             owner.available_skills.remove(self._temp_rct_skill)
@@ -976,6 +1065,7 @@ class SukunaCorePassive(Passive):
             if self.domain_turns_left > 0:
                 self.domain_turns_left = 0
                 self._on_domain_ended(engine)
+            self._kill_body_parts(engine)
             return
 
         if self.domain_turns_left > 0 and not self.burnout_active:
@@ -987,7 +1077,6 @@ class SukunaCorePassive(Passive):
                 )
                 self._on_domain_ended(engine)
 
-        # 双嘴四手同时在场：3回合内全部拼点胜利 -> 再释放一次空间斩
         if self.wcs_challenge_active and engine.global_turn > self.wcs_challenge_started_turn:
             if not owner.alive or not self._both_parts_alive():
                 engine.log("  [空间斩蓄势中断] 双嘴或四手已不在场，挑战重置！")
@@ -1018,7 +1107,7 @@ class SukunaCorePassive(Passive):
                     self._reset_wcs_challenge()
 
     # ------------------------------------------------------------------
-    # 选技前/后、领域对拼拦截 & 打双嘴四手时宿傩代为拼点
+    # 选技前/后与领域对拼拦截
     # ------------------------------------------------------------------
     def _on_before_select(self, ctx: EventContext) -> None:
         engine = ctx.engine
@@ -1065,12 +1154,15 @@ class SukunaCorePassive(Passive):
         if self.rct_count > 0 and not any(
             isinstance(s, ReverseCursedTechniqueSkill) for s in owner.available_skills
         ):
-            self._temp_rct_skill = ReverseCursedTechniqueSkill()
-            owner.available_skills.insert(0, self._temp_rct_skill)
+            rct_sk = ReverseCursedTechniqueSkill()
+            if rct_sk.can_use(engine, owner):
+                self._temp_rct_skill = rct_sk
+                owner.available_skills.insert(0, rct_sk)
 
     def _on_after_select(self, ctx: EventContext) -> None:
         action: Action = ctx.data["action"]
         owner = self.owner
+        engine = ctx.engine
         if not owner:
             return
 
@@ -1086,7 +1178,6 @@ class SukunaCorePassive(Passive):
         if self.domain_active() and action.actor.team != owner.team and action.skill is not None:
             tgt = action.actor
             loss = max(1, floor_mul(tgt.max_hp, 1, 100))
-            engine = ctx.engine
             engine.log(f"  [伏魔御厨子] {tgt.name} 在领域内行动，受到 {loss} 点切割伤害！")
             engine.apply_damage(
                 attacker=owner,
@@ -1097,8 +1188,56 @@ class SukunaCorePassive(Passive):
                 allow_breath=False,
             )
 
+        targets_sukuna = (
+            owner in action.targets
+            or (
+                action.skill is not None
+                and action.skill.is_aoe
+                and not action.targets
+                and not action.skill.clash_aoe
+                and (
+                    action.skill.indiscriminate
+                    or action.skill.target_type in ("all_enemies", "all_others", "aoe")
+                )
+            )
+        )
+        living_parts = self._get_living_parts()
+        if (
+            self.true_form_triggered
+            and living_parts
+            and action.actor.alive
+            and action.actor.team != owner.team
+            and action.skill is not None
+            and not action.cancelled
+            and targets_sukuna
+        ):
+            if len(living_parts) == 1:
+                chosen_part = living_parts[0]
+                engine.log(
+                    f"  [为咒术而生的肉体] 仅剩【{chosen_part.name}】({chosen_part.hp}/{chosen_part.max_hp} HP)，"
+                    f"本次攻击同步至【{chosen_part.name}】"
+                )
+            elif self._is_manual_actor(engine, action.actor):
+                print(
+                    f"  [为咒术而生的肉体] 已选定攻击 {owner.name}，请选择同步伤害的部位："
+                )
+                for idx, part in enumerate(living_parts):
+                    print(f"    {idx}: {part.name} (HP:{part.hp}/{part.max_hp})")
+                while True:
+                    raw = input("  请输入部位编号: ").strip()
+                    if raw.isdigit() and 0 <= int(raw) < len(living_parts):
+                        chosen_part = living_parts[int(raw)]
+                        break
+                    print("  输入无效，请重新输入。")
+            else:
+                chosen_part = engine.rng.choice(living_parts)
+                engine.log(
+                    f"  [为咒术而生的肉体] {action.actor.name} 选择攻击部位：【{chosen_part.name}】"
+                    f"(HP:{chosen_part.hp}/{chosen_part.max_hp})"
+                )
+            action.extra["chosen_part"] = chosen_part
+
     def _on_aoe_start(self, ctx: EventContext) -> None:
-        """领域内敌方释放非拼点群攻（含普通群攻、无差别群攻、全队增益群攻等）：取消原群攻并触发领域对拼"""
         owner = self.owner
         if not owner or not owner.alive or not self.domain_active():
             return
@@ -1128,17 +1267,12 @@ class SukunaCorePassive(Passive):
         self._run_domain_clash(ctx.engine, clash_enemy_act)
 
     def _on_resolve_matchups(self, ctx: EventContext) -> None:
-        """
-        1) 若宿傩领域开启，敌方在本回合剩余行动中存在群攻（如拼点群攻 clash_aoe），优先触发领域对拼；
-        2) 打「双嘴」或「四手」时，让宿傩前去迎击拼点。
-        """
         owner = self.owner
         if not owner or not owner.alive:
             return
 
         actions: List[Action] = ctx.data["actions"]
 
-        # 1) 领域内敌方拼点群攻触发领域对拼
         if self.domain_active():
             for e_act in list(actions):
                 if (
@@ -1165,71 +1299,6 @@ class SukunaCorePassive(Passive):
                     extra=dict(e_act.extra),
                 )
                 self._run_domain_clash(ctx.engine, clash_enemy_act)
-
-        if not self.true_form_triggered:
-            return
-        if not ((self.mouth_part and self.mouth_part.alive) or (self.arms_part and self.arms_part.alive)):
-            return
-
-        def _can_clash(act: Action) -> bool:
-            return (
-                not act.cancelled
-                and act.skill is not None
-                and act.clashable
-                and act.skill.clashable
-                and (not act.skill.is_aoe or act.skill.clash_aoe)
-            )
-
-        # 找出宿傩所有可拼点动作，先标记已经和直指宿傩的敌人互指的动作
-        sukuna_actions = [a for a in actions if a.actor is owner and _can_clash(a)]
-        already_paired_sukuna: Set[int] = set()
-        for s_act in sukuna_actions:
-            for e_act in actions:
-                if (
-                    e_act.actor is not owner
-                    and _can_clash(e_act)
-                    and owner in e_act.targets
-                    and e_act.actor in s_act.targets
-                ):
-                    already_paired_sukuna.add(id(s_act))
-                    break
-
-        free_sukuna = [s for s in sukuna_actions if id(s) not in already_paired_sukuna]
-        if not free_sukuna:
-            return
-
-        for e_act in actions:
-            if not free_sukuna:
-                break
-            if e_act.actor.team == owner.team or not _can_clash(e_act):
-                continue
-
-            part_tgt: Optional[Character] = None
-            for t in e_act.targets:
-                if self._is_body_part(t) and t.alive:
-                    part_tgt = t
-                    break
-            if part_tgt is None:
-                continue
-
-            # 优先选用本来就指着该敌人的宿傩动作，否则任选一个空闲的宿傩动作
-            chosen_s: Optional[Action] = None
-            for s_act in free_sukuna:
-                if e_act.actor in s_act.targets:
-                    chosen_s = s_act
-                    break
-            if chosen_s is None:
-                chosen_s = free_sukuna[0]
-
-            free_sukuna.remove(chosen_s)
-            e_act.extra["redirected_from_part"] = part_tgt
-            e_act.targets = [owner if t is part_tgt else t for t in e_act.targets]
-            if e_act.actor not in chosen_s.targets and not chosen_s.skill.is_aoe:
-                chosen_s.targets = [e_act.actor]
-
-            ctx.engine.log(
-                f"  [护体迎击] {e_act.actor.name} 攻击【{part_tgt.name}】，{owner.name} 上前代为拼点！"
-            )
 
     # ------------------------------------------------------------------
     # 掷骰与拼点阶段（免改 combat.py 接管含宿傩的拼点）
@@ -1269,7 +1338,16 @@ class SukunaCorePassive(Passive):
             targeting_sukuna = (
                 (clash_opp is owner)
                 or (owner in action.targets)
-                or (action.extra.get("redirected_from_part") is not None)
+                or (
+                    action.skill is not None
+                    and action.skill.is_aoe
+                    and not action.targets
+                    and not action.skill.clash_aoe
+                    and (
+                        action.skill.indiscriminate
+                        or action.skill.target_type in ("all_enemies", "all_others", "aoe")
+                    )
+                )
             )
             skey = skill.skill_id or skill.name
             if targeting_sukuna:
@@ -1322,7 +1400,16 @@ class SukunaCorePassive(Passive):
             targeting_sukuna = (
                 (clash_opp is owner)
                 or (owner in action.targets)
-                or (action.extra.get("redirected_from_part") is not None)
+                or (
+                    action.skill is not None
+                    and action.skill.is_aoe
+                    and not action.targets
+                    and not action.skill.clash_aoe
+                    and (
+                        action.skill.indiscriminate
+                        or action.skill.target_type in ("all_enemies", "all_others", "aoe")
+                    )
+                )
             )
             if targeting_sukuna:
                 skey = skill.skill_id or skill.name
@@ -1351,10 +1438,6 @@ class SukunaCorePassive(Passive):
             )
 
     def _on_clash_start_intercept(self, ctx: EventContext) -> None:
-        """
-        无需改动 combat.py：利用 CLASH_START 取消原循环，在此运行支持回读 roll1/roll2 的拼点循环，
-        并在分出胜负后把“打双嘴/四手”被重定向的受击目标还原回对应部位，同时结算领域对拼结果。
-        """
         owner = self.owner
         if not owner or not owner.alive:
             return
@@ -1411,13 +1494,6 @@ class SukunaCorePassive(Passive):
         assert winner_act is not None and loser_act is not None
         assert winner_act.skill is not None and loser_act.skill is not None
 
-        # 如果敌方原本打的是「双嘴」或「四手」，拼点完成后把受击目标还原为原部位
-        opp_act = act2 if act1.actor is owner else act1
-        part_tgt: Optional[Character] = opp_act.extra.get("redirected_from_part")
-        if part_tgt is not None:
-            opp_act.targets = [part_tgt if t is owner else t for t in opp_act.targets]
-
-        # 领域对拼失败：宿傩「灶」碎裂，领域立即破碎并提前取消
         if loser_act.extra.get("is_domain_clash"):
             loser_act.extra["destroy_unbreakable"] = True
             self._shatter_domain(engine)
@@ -1426,6 +1502,8 @@ class SukunaCorePassive(Passive):
         winner_act.skill.on_clash_win(engine, winner_act, loser_act, win_roll)
 
         unbreakable_act = engine._build_unbreakable_action(winner_act, loser_act, from_aoe=False)
+        if unbreakable_act is not None and "chosen_part" in loser_act.extra:
+            unbreakable_act.extra["chosen_part"] = loser_act.extra["chosen_part"]
         destroyed = unbreakable_act is None
 
         if destroyed:
@@ -1468,7 +1546,6 @@ class SukunaCorePassive(Passive):
 
         engine._execute_skill_hits(winner_act, win_roll)
 
-        # 领域对拼获胜后处理：登记领域结束后的敌方术式熔断，红币群攻触发落花之情与台词
         if winner_act.extra.get("is_domain_clash"):
             opp = loser_act.actor
             if opp not in self._domain_burnout_targets:
@@ -1490,7 +1567,6 @@ class SukunaCorePassive(Passive):
         if unbreakable_act is not None and unbreakable_act.actor.alive and not engine.check_victory():
             engine._resolve_unbreakable_attack(unbreakable_act)
 
-        # 若有敌方连续拼输10次触发【好不容易来了点兴致就和你玩玩吧】，立即用「灶」与其最大点数技能拼点
         self._flush_pending_fuga_clashes(engine)
 
     def _on_clash_roll(self, ctx: EventContext) -> None:
@@ -1510,7 +1586,6 @@ class SukunaCorePassive(Passive):
         s_roll = r1 if is_p1 else r2
         o_roll = r2 if is_p1 else r1
 
-        # 1) 黑闪：仅基础技能触发，点数相差 1（领先或落后都算）时转红币并使本次点数 ×2.5
         if (
             sukuna_act.skill
             and "sukuna_basic" in sukuna_act.skill.tags
@@ -1542,7 +1617,6 @@ class SukunaCorePassive(Passive):
             )
             self._try_activate_domain(engine)
 
-        # 2) 咒术师：点数小于对手时，消耗 7 层咒力将点数提升至与对手一致（强制打平）
         if s_roll < o_roll and self.cursed_energy >= 7:
             self.cursed_energy -= 7
             self.consumed_cursed_energy += 7
@@ -1556,7 +1630,6 @@ class SukunaCorePassive(Passive):
 
         sukuna_act.extra["last_clash_diff"] = s_roll - o_roll
 
-        # 3) 兴致：打平（整场首次+2，之后+1）
         if s_roll == o_roll:
             req = 2 if not self.first_tie_or_lose_done else 1
             self.first_tie_or_lose_done = True
@@ -1572,7 +1645,6 @@ class SukunaCorePassive(Passive):
         win_act: Action = ctx.data["winner_action"]
         lose_act: Action = ctx.data["loser_action"]
 
-        # 敌方拼点获胜：清空其连续拼输计数
         if win_act.actor.team != owner.team:
             opp_id = id(win_act.actor)
             if self.enemy_consecutive_losses.get(opp_id, 0) > 0:
@@ -1588,13 +1660,11 @@ class SukunaCorePassive(Passive):
         engine = ctx.engine
         opp = lose_act.actor
 
-        # 咒术师：拼点胜利获得 2 层咒力
         self.cursed_energy += 2
         engine.log(
             f"  [咒术师] {owner.name} 拼点胜利，获得 2 层咒力（当前: {self.cursed_energy}）"
         )
 
-        # 兴致减少条件：敌方拥有加威力状态，且点数相差 >= 3 时拼赢
         has_power_buff = bool(lose_act.extra.get("had_power_increase"))
         diff = win_act.extra.get("last_clash_diff", 0)
         if has_power_buff and diff >= 3 and self.excitement > 0:
@@ -1604,7 +1674,6 @@ class SukunaCorePassive(Passive):
                 f"{owner.name} 兴致 -1（当前: {self.excitement}/{MAX_EXCITEMENT}）"
             )
 
-        # 头抬太高了：取消这个拼输的敌人本轮额外行动
         if engine.round_num >= self.head_too_high_ready_round:
             self.head_too_high_ready_round = engine.round_num + 2
             self.blocked_pursuit_targets_round[id(opp)] = engine.round_num
@@ -1618,7 +1687,6 @@ class SukunaCorePassive(Passive):
                 + ("（已拦截队列中追击）" if removed_any else "")
             )
 
-        # 原身启动：神武解追击
         if self.true_form_triggered and opp.alive:
             engine.log(f"  [神武解] {owner.name} 拼点胜利，发动【神武解】追击！")
             engine.enqueue_action(
@@ -1633,7 +1701,6 @@ class SukunaCorePassive(Passive):
                 front=True,
             )
 
-        # 双嘴四手同时在场拼点胜利统计 -> 5胜后开启3回合全胜空间斩挑战
         if self._both_parts_alive():
             if self.wcs_challenge_active:
                 if not self.wcs_challenge_failed:
@@ -1665,7 +1732,6 @@ class SukunaCorePassive(Passive):
         lose_act: Action = ctx.data["loser_action"]
         win_act: Action = ctx.data["winner_action"]
 
-        # 好不容易来了点兴致就和你玩玩吧：敌方连续拼输10次 -> 最大点数技能 vs 宿傩的「灶」
         if lose_act.actor.team != owner.team and win_act.actor.team == owner.team:
             opp = lose_act.actor
             opp_id = id(opp)
@@ -1717,7 +1783,6 @@ class SukunaCorePassive(Passive):
                 ctx.engine.log(f"  [头抬太高了] 拦截了 {action.actor.name} 的额外行动！")
 
     def _on_unbreakable_start(self, ctx: EventContext) -> None:
-        """好好的品尝自己的那份不幸不就好了：敌方碎红币进攻宿傩时，使用额外2技能拼点"""
         owner = self.owner
         if not owner or not owner.alive:
             return
@@ -1753,7 +1818,7 @@ class SukunaCorePassive(Passive):
             engine.log(f"  [迎击失利] 碎红币继续命中 {owner.name}！")
 
     # ------------------------------------------------------------------
-    # 伤害计算 / 免伤 / 抱歉切成三段 / 受击同步 / 适应一二三 / 安慰奖
+    # 伤害计算 / 减免 / 抱歉切成三段 / 受击同步 / 适应一二三 / 安慰奖
     # ------------------------------------------------------------------
     def _on_calc_damage(self, ctx: EventContext) -> None:
         dmg_ctx: DamageContext = ctx.data["damage_context"]
@@ -1802,11 +1867,6 @@ class SukunaCorePassive(Passive):
         dmg_ctx.extra["pre_take_dmg"] = dmg_ctx.damage
 
     def _on_before_take_damage_sorry_passive(self, ctx: EventContext) -> None:
-        """
-        抱歉抱歉，原本想把你切成三段的：
-        若攻击命中时敌方拥有buff抵消伤害，则使自己加二兴致，并立即追击一次二技能；
-        若兴致已满，则不加兴致，依然追击二技能并将该追击二技能伤害 ×2。
-        """
         owner = self.owner
         if not owner or not owner.alive:
             return
@@ -1893,19 +1953,6 @@ class SukunaCorePassive(Passive):
 
         if (
             not ignore_reduction
-            and self.true_form_triggered
-            and not dmg_ctx.extra.get("from_body_part")
-            and (
-                (self.mouth_part and self.mouth_part.alive)
-                or (self.arms_part and self.arms_part.alive)
-            )
-        ):
-            dmg_ctx.cancelled = True
-            ctx.engine.log(f"  [为咒术而生的肉体] {owner.name} 本体免疫本次直接伤害！")
-            return
-
-        if (
-            not ignore_reduction
             and dmg_ctx.skill is not None
             and dmg_ctx.attacker is not None
             and dmg_ctx.attacker.team != owner.team
@@ -1981,27 +2028,6 @@ class SukunaCorePassive(Passive):
             return
 
         if (
-            self.true_form_triggered
-            and self._is_body_part(dmg_ctx.target)
-            and actual_loss > 0
-            and owner.alive
-        ):
-            sync_loss = (
-                floor_div(actual_loss, 2)
-                if dmg_ctx.source_type == "aoe"
-                else actual_loss
-            )
-            if sync_loss > 0:
-                owner.hp = max(0, owner.hp - sync_loss)
-                engine.log(
-                    f"  [肉体同步] {dmg_ctx.target.name} 受创，同步 {sync_loss} 点伤害至 {owner.name} "
-                    f"(HP: {owner.hp}/{owner.max_hp})"
-                )
-                engine._check_death(owner, killer=dmg_ctx.attacker)
-                engine.bgm.evaluate(reason="宿傩部位同步扣血")
-            return
-
-        if (
             dmg_ctx.attacker is owner
             and dmg_ctx.skill is not None
             and "world_cutting_slash" in dmg_ctx.skill.tags
@@ -2028,7 +2054,6 @@ class SukunaCorePassive(Passive):
                     engine.apply_status(tgt, "流血", coin_count, source=owner)
 
             if self.technique_active() and self.mahoraga_enabled and tgt.alive:
-                # 适应二 15层：自身每枚硬币均可施加 1 层该负面效果
                 if dmg_ctx.skill is not None and len(dmg_ctx.skill.coins) > 0:
                     coin_count = len(dmg_ctx.skill.coins)
                     for st_name, lvl in list(self.adapt2_debuffs.items()):
@@ -2048,6 +2073,34 @@ class SukunaCorePassive(Passive):
 
         if dmg_ctx.target is owner and actual_loss > 0:
             self._check_mahoraga_unlock(engine)
+
+            if (
+                self.true_form_triggered
+                and dmg_ctx.skill is not None
+                and dmg_ctx.attacker is not None
+                and dmg_ctx.attacker.team != owner.team
+            ):
+                living_parts = self._get_living_parts()
+                if living_parts:
+                    action: Optional[Action] = ctx.data.get("action")
+                    part = action.extra.get("chosen_part") if action else None
+                    if part is None or not part.alive:
+                        part = engine.rng.choice(living_parts)
+
+                    part.hp = max(0, part.hp - actual_loss)
+                    engine.log(
+                        f"  [肉体同步] {owner.name} 受创，同步 {actual_loss} 点伤害至【{part.name}】 "
+                        f"(HP: {part.hp}/{part.max_hp})"
+                    )
+                    if part.hp <= 0 and part.alive:
+                        part.alive = False
+                        engine.log(f"  [为咒术而生的肉体] 【{part.name}】已被破坏！")
+                        if not self._get_living_parts():
+                            engine.log(
+                                f"  [为咒术而生的肉体] 「双嘴」与「四手」已全部破坏！"
+                            )
+                            if self.wcs_challenge_active:
+                                self._reset_wcs_challenge()
 
             if actual_loss >= 150 and self.technique_active():
                 self.heavy_hit_count_150 += 1
@@ -2111,11 +2164,7 @@ class SukunaCorePassive(Passive):
             or (extra_cat == "debuff")
         )
 
-        # 1) 敌方被宿傩判定为本技能无效（适应一15层）：阻止对宿傩施加负面效果
         if target is owner and is_debuff and source is not None:
-            if id(source) in self._nullified_enemy_actors:
-                ctx.cancelled = True
-                return
             if self.technique_active() and self.mahoraga_enabled:
                 skey = self._enemy_active_skill_vs_sukuna.get(id(source))
                 if skey and self.adapt1_skills.get(skey, 0) >= 15:
@@ -2125,7 +2174,6 @@ class SukunaCorePassive(Passive):
                     )
                     return
 
-        # 2) 适应二（>=15层）：不再会被对应负面效果施加
         if (
             target is owner
             and is_debuff
@@ -2137,7 +2185,6 @@ class SukunaCorePassive(Passive):
             ctx.engine.log(f"  [适应二·15层] {owner.name} 已完全免疫 {status_name} 的施加！")
             return
 
-        # 3) 宿傩主动施加负面效果时的倍率叠加
         if source is owner and target is not owner and is_debuff:
             if self.arms_part and self.arms_part.alive:
                 ctx.data["stacks"] = floor_mul(ctx.data["stacks"], 2, 1)
@@ -2152,25 +2199,8 @@ class SukunaCorePassive(Passive):
                         break
 
     # ------------------------------------------------------------------
-    # 锁血一阶段（也就是说…是？赢了）、二阶段（原身启动！）与部位破坏提示
+    # 锁血一阶段（也就是说…是？赢了）与二阶段（原身启动！）
     # ------------------------------------------------------------------
-    def _on_part_death_notify(self, ctx: EventContext) -> None:
-        owner = self.owner
-        char: Character = ctx.data["character"]
-        if not owner or ctx.cancelled or char.hp > 0:
-            return
-        if not self._is_body_part(char):
-            return
-
-        other = self.arms_part if char is self.mouth_part else self.mouth_part
-        other_alive = other is not None and other.alive and other.hp > 0
-        if not other_alive and owner.alive:
-            ctx.engine.log(
-                f"  [为咒术而生的肉体] 「双嘴」与「四手」已全部破坏，{owner.name} 本体恢复可受伤害状态！"
-            )
-            if self.wcs_challenge_active:
-                self._reset_wcs_challenge()
-
     def _on_character_death(self, ctx: EventContext) -> None:
         owner = self.owner
         char: Character = ctx.data["character"]
@@ -2183,6 +2213,7 @@ class SukunaCorePassive(Passive):
             if self.domain_turns_left > 0:
                 self.domain_turns_left = 0
                 self._on_domain_ended(ctx.engine)
+            self._kill_body_parts(ctx.engine)
             return
 
         engine = ctx.engine
@@ -2237,9 +2268,7 @@ class SukunaCorePassive(Passive):
                 team=owner.team,
                 sukuna=owner,
             )
-            engine.add_character(self.mouth_part)
-            engine.add_character(self.arms_part)
-            engine.log("  [为咒术而生的肉体] 场上追加可攻击对象：【双嘴】(100 HP) 与 【四手】(100 HP)！")
+            engine.log("  [为咒术而生的肉体] 场上追加可攻击部位：【双嘴】(100 HP) 与 【四手】(100 HP)！")
 
             target = killer if (killer and killer.alive and killer is not owner) else None
             if target is None:
@@ -2260,18 +2289,20 @@ class SukunaCorePassive(Passive):
                 )
             return
 
-        # 宿傩真正阵亡时清理尚未结束的领域状态
         if self.domain_turns_left > 0:
             self.domain_turns_left = 0
             self._on_domain_ended(engine)
+        self._kill_body_parts(engine)
 
 
-def create_character(team: str = "P1", **kwargs) -> Character:
-    aizo_track = BGMTrack(
-        track_id=f"sukuna_aizo_{team}",
-        title="aizo",
-        file_path=None,  # 后续若接入 pygame 等真音频后端，可填音频文件路径如 "bgm/aizo.mp3"
-        loop=True,
+def create_character(team: str = "P1", **kwargs: Any) -> Character:
+    bgm = BGMTrack(
+        track_id=f"sukuna_{team}_aizo",
+        title="AIZO",
+        file_path=AIZO_AUDIO_PATH,
+        duration_sec=AIZO_DURATION_SEC,
+        condition=lambda eng, tr: bool(tr.owner and tr.owner.custom_state.get("aizo_active")),
+        stop_on_owner_death=True,
         extra_data={"aizo_theme": True},
     )
     char = Character(
@@ -2280,7 +2311,10 @@ def create_character(team: str = "P1", **kwargs) -> Character:
         team=team,
         max_hp=SUKUNA_MAX_HP,
         passives=[SukunaCorePassive()],
-        bgm_tracks=[aizo_track],
+        bgm_tracks=[bgm],
+        custom_state={
+            "aizo_active": False,
+        },
     )
     char.set_standard_skills(SukunaSkill1(), SukunaSkill2(), SukunaSkill3())
     return char
