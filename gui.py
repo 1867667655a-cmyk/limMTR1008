@@ -236,6 +236,8 @@ class GameWindow:
 
         # 战前配置状态
         self.available_files: List[Tuple[Path, str]] = []
+        self.external_files: List[Path] = []
+        self._char_name_cache: Dict[Path, Tuple[float, str]] = {}
         self.p1_paths: List[Path] = []
         self.p2_paths: List[Path] = []
         self.mode_var = tk.StringVar(value="2")
@@ -462,27 +464,93 @@ class GameWindow:
         self._refresh_library()
         self._refresh_rosters()
 
+    def _resolve_character_name(self, path: Path, force_reload: bool = False) -> Tuple[str, bool]:
+        """读取角色卡文件并返回 (角色本身名称, 是否成功加载)"""
+        resolved = path.resolve()
+        try:
+            mtime = resolved.stat().st_mtime
+        except OSError:
+            mtime = -1.0
+
+        if not force_reload and resolved in self._char_name_cache:
+            cached_mtime, cached_name = self._char_name_cache[resolved]
+            if cached_mtime == mtime:
+                return cached_name, True
+
+        try:
+            char = load_character_from_file(resolved, team="P1", search_dir=self.char_dir)
+            name = (char.name or "").strip() or path.stem
+            self._char_name_cache[resolved] = (mtime, name)
+            return name, True
+        except Exception:
+            return path.name, False
+
     def _refresh_library(self) -> None:
-        self.available_files = load_characters_from_dir(self.char_dir)
+        dir_entries = load_characters_from_dir(self.char_dir)
+        entries: List[Tuple[Path, bool]] = [(p, False) for p, _ in dir_entries]
+        seen_resolved = {p.resolve() for p, _ in entries}
+
+        kept_external: List[Path] = []
+        for ext_p in self.external_files:
+            if ext_p.exists() and ext_p.is_file() and ext_p.resolve() not in seen_resolved:
+                entries.append((ext_p, True))
+                seen_resolved.add(ext_p.resolve())
+                kept_external.append(ext_p)
+        self.external_files = kept_external
+
+        resolved_entries: List[Tuple[Path, str, bool, bool]] = []
+        name_counts: Dict[str, int] = {}
+        for p, is_ext in entries:
+            cname, ok = self._resolve_character_name(p, force_reload=True)
+            resolved_entries.append((p, cname, ok, is_ext))
+            if ok:
+                name_counts[cname] = name_counts.get(cname, 0) + 1
+
+        self.available_files = []
         self.lib_lb.delete(0, tk.END)
-        for path, _ in self.available_files:
-            self.lib_lb.insert(tk.END, path.name)
+        for p, cname, ok, is_ext in resolved_entries:
+            if not ok:
+                disp = f"{p.name} [无效角色卡]"
+            else:
+                disp = cname
+                if name_counts.get(cname, 0) > 1:
+                    disp = f"{disp} ({p.name})"
+                if is_ext:
+                    disp = f"{disp} [外部]"
+            self.available_files.append((p, disp))
+            self.lib_lb.insert(tk.END, disp)
+
         if self.available_files:
             self.lib_lb.selection_set(0)
+        if hasattr(self, "p1_lb") and hasattr(self, "p2_lb"):
+            self._refresh_rosters()
 
     def _refresh_rosters(self) -> None:
+        lib_label_map = {p.resolve(): label for p, label in self.available_files}
+
+        def _label_for(path: Path) -> str:
+            r = path.resolve()
+            if r in lib_label_map:
+                return lib_label_map[r]
+            cname, ok = self._resolve_character_name(path)
+            return cname if ok else f"{path.name} [无效角色卡]"
+
         self.p1_lb.delete(0, tk.END)
         for i, p in enumerate(self.p1_paths, 1):
-            self.p1_lb.insert(tk.END, f"{i}. {p.name}")
+            self.p1_lb.insert(tk.END, f"{i}. {_label_for(p)}")
         self.p2_lb.delete(0, tk.END)
         for i, p in enumerate(self.p2_paths, 1):
-            self.p2_lb.insert(tk.END, f"{i}. {p.name}")
+            self.p2_lb.insert(tk.END, f"{i}. {_label_for(p)}")
 
     def _add_char(self, team: str) -> None:
         sel = self.lib_lb.curselection()
         if not sel:
             return
         path = self.available_files[sel[0]][0]
+        _, ok = self._resolve_character_name(path)
+        if not ok:
+            messagebox.showwarning("无法加入", f"该文件不是有效的角色卡：\n{path.name}")
+            return
         if team == "P1":
             self.p1_paths.append(path)
         else:
@@ -497,11 +565,30 @@ class GameWindow:
         if not fpath:
             return
         p = Path(fpath)
-        if (p, p.stem) not in self.available_files:
-            self.available_files.append((p, p.stem))
-            self.lib_lb.insert(tk.END, f"{p.name} (外部)")
-            self.lib_lb.selection_clear(0, tk.END)
-            self.lib_lb.selection_set(tk.END)
+        resolved = p.resolve()
+
+        for idx, (existing_p, _) in enumerate(self.available_files):
+            if existing_p.resolve() == resolved:
+                self.lib_lb.selection_clear(0, tk.END)
+                self.lib_lb.selection_set(idx)
+                self.lib_lb.see(idx)
+                return
+
+        _, ok = self._resolve_character_name(p, force_reload=True)
+        if not ok:
+            messagebox.showerror("加载失败", f"所选文件不是有效的角色卡：\n{p}")
+            return
+
+        if resolved not in {ep.resolve() for ep in self.external_files}:
+            self.external_files.append(p)
+        self._refresh_library()
+
+        for idx, (existing_p, _) in enumerate(self.available_files):
+            if existing_p.resolve() == resolved:
+                self.lib_lb.selection_clear(0, tk.END)
+                self.lib_lb.selection_set(idx)
+                self.lib_lb.see(idx)
+                break
 
     def _remove_char(self, team: str) -> None:
         lb = self.p1_lb if team == "P1" else self.p2_lb
