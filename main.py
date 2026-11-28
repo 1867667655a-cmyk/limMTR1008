@@ -95,7 +95,8 @@ def cli_manual_selector(
     ]
 
     print(
-        f"\n>>> 轮到 [{char.team}] {char.name} (HP: {char.hp}/{char.max_hp} | 速度:{engine.format_hp_percent(char)}) 选择技能 "
+        f"\n>>> 轮到 [{char.team}] {char.name} "
+        f"(速度:{engine.get_speed(char)} | HP:{char.hp}/{char.max_hp} {engine.format_hp_percent(char)}) 选择技能 "
         f"(槽位 {slot_idx + 1} | 自动投掷: {'开启' if engine.auto_roll else '关闭'}):"
     )
     if previous_selections:
@@ -108,7 +109,8 @@ def cli_manual_selector(
             ) or "-"
             tag = " [已被拦截]" if act.extra.get("intercepted_by") else ""
             print(
-                f"    - [{act.actor.team}] {act.actor.name}({engine.format_hp_percent(act.actor)}): "
+                f"    - [{act.actor.team}] {act.actor.name}"
+                f"(速度:{engine.get_speed(act.actor)} | {engine.format_hp_percent(act.actor)}): "
                 f"{s_name} -> {tgts}{tag}"
             )
 
@@ -154,7 +156,7 @@ def cli_manual_selector(
             st_info = f" | 状态: {st}" if st else ""
             print(
                 f"    {idx}: [{side}] {tgt.name} "
-                f"(HP:{tgt.hp}/{tgt.max_hp} | 速度:{engine.format_hp_percent(tgt)}{st_info})"
+                f"(速度:{engine.get_speed(tgt)} | HP:{tgt.hp}/{tgt.max_hp} {engine.format_hp_percent(tgt)}{st_info})"
             )
         while True:
             traw = input("  请输入目标编号 (输入 a 可切换自动投掷): ").strip().lower()
@@ -186,8 +188,8 @@ def cli_manual_selector(
         )
         if interceptables:
             print(
-                f"  [速度压制] {char.name}({engine.format_hp_percent(char)}) 比 "
-                f"{tgt.name}({engine.format_hp_percent(tgt)}) 更快，请选择攻击方式："
+                f"  [速度压制] {char.name}(速度:{engine.get_speed(char)}) 比 "
+                f"{tgt.name}(速度:{engine.get_speed(tgt)}) 更快，请选择攻击方式："
             )
             print(f"    0: 单方面攻击（不改变 {tgt.name} 的原攻击对象，直接发动单方面攻击）")
             for i, s_act in enumerate(interceptables, start=1):
