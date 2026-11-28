@@ -55,6 +55,7 @@ class CombatEngine:
 
         self.action_queue: Deque[Action] = deque()
         self.current_turn_selections: List[Action] = []
+        self._turn_speeds: Dict[int, int] = {}
         self.game_over: bool = False
         self.winner_team: Optional[str] = None
 
@@ -498,7 +499,7 @@ class CombatEngine:
             self.action_queue.append(action)
 
     # ------------------------------------------------------------------
-    # 百分比血量速度与选技/拦截逻辑
+    # 速度（1, 2, 3... 数字越大越快；血量%越多速度越慢越先动，血量%越少速度越快越后动）
     # ------------------------------------------------------------------
     @staticmethod
     def get_hp_ratio(char: Character) -> Fraction:
@@ -512,8 +513,29 @@ class CombatEngine:
             return "0.0%"
         return f"{(max(0, char.hp) * 100) / char.max_hp:.1f}%"
 
+    def compute_speed_map(self) -> Dict[int, int]:
+        """
+        为场上所有存活角色计算速度编号：
+        百分比血量最多者 -> 速度 1（最慢，最先动）
+        百分比血量中间者 -> 速度 2（中间动）
+        百分比血量最少者 -> 速度 3（最快，最后动）
+        同百分比血量共享同一速度编号。
+        """
+        living = self.get_living_characters()
+        distinct_ratios = sorted(
+            {self.get_hp_ratio(c) for c in living},
+            reverse=True,
+        )
+        ratio_to_speed = {ratio: idx for idx, ratio in enumerate(distinct_ratios, start=1)}
+        return {id(c): ratio_to_speed[self.get_hp_ratio(c)] for c in living}
+
+    def get_speed(self, char: Character) -> int:
+        if self._turn_speeds and id(char) in self._turn_speeds:
+            return self._turn_speeds[id(char)]
+        return self.compute_speed_map().get(id(char), 1)
+
     def is_faster_than(self, actor: Character, other: Character) -> bool:
-        return self.get_hp_ratio(actor) > self.get_hp_ratio(other)
+        return self.get_speed(actor) > self.get_speed(other)
 
     def get_interceptable_actions(
         self,
@@ -567,21 +589,25 @@ class CombatEngine:
             action.extra["unopposed_skip_actions"] = skip_ids
 
     def compute_selection_order(self) -> List[Tuple[Character, int]]:
+        speed_map = self.compute_speed_map()
+        self._turn_speeds = speed_map
+
         living = self.get_living_characters()
         all_slots: List[Tuple[Character, int]] = []
         for c in living:
             for slot_idx in range(c.action_slots):
                 all_slots.append((c, slot_idx))
 
-        ratio_buckets: Dict[Fraction, List[Tuple[Character, int]]] = {}
+        speed_buckets: Dict[int, List[Tuple[Character, int]]] = {}
         for item in all_slots:
-            ratio_buckets.setdefault(self.get_hp_ratio(item[0]), []).append(item)
+            spd = speed_map.get(id(item[0]), 1)
+            speed_buckets.setdefault(spd, []).append(item)
 
         ordered: List[Tuple[Character, int]] = []
         starter = self._tie_turn_starter
-        # 百分比血量越低速度越慢、越先动；百分比血量越高速度越快、越后动（可拦截慢速技能）
-        for ratio_val in sorted(ratio_buckets.keys(), reverse=False):
-            bucket = ratio_buckets[ratio_val]
+        # 1号（血量%最多，速度1）最先动，2号中间动，3号（血量%最少，速度3，最快）最后动
+        for spd in sorted(speed_buckets.keys()):
+            bucket = speed_buckets[spd]
             teams_in_bucket: Dict[str, List[Tuple[Character, int]]] = {}
             for item in bucket:
                 teams_in_bucket.setdefault(item[0].team, []).append(item)
@@ -670,7 +696,8 @@ class CombatEngine:
                 else ""
             )
             self.log(
-                f"  [{c.team}] {c.name} HP:{c.hp}/{c.max_hp} ({self.format_hp_percent(c)}) "
+                f"  [{c.team}] {c.name} 速度:{self.get_speed(c)} "
+                f"HP:{c.hp}/{c.max_hp}({self.format_hp_percent(c)}) "
                 f"(余牌:{len(c.available_skills)}){st_str}"
             )
             p_str = c.format_triggered_passives(self)
@@ -727,157 +754,161 @@ class CombatEngine:
 
     def run_turn(self) -> None:
         self.log(f"\n--- 第 {self.round_num} 轮 / 第 {self.turn_in_round} 回合 ---")
-        self.events.emit(
-            EventType.TURN_START,
-            self,
-            round_num=self.round_num,
-            turn_in_round=self.turn_in_round,
-            global_turn=self.global_turn,
-        )
-        self.bgm.evaluate(reason="回合开始")
-
-        if self.show_turn_board:
-            self._log_turn_board()
-
-        order = self.compute_selection_order()
-        self.current_turn_selections = []
-
-        for char, slot_idx in order:
-            if not char.alive:
-                continue
-            pre_ctx = self.events.emit(
-                EventType.BEFORE_SELECT_ACTION,
-                self,
-                character=char,
-                slot_idx=slot_idx,
-                previous_selections=self.current_turn_selections,
-            )
-            if pre_ctx.cancelled:
-                continue
-
-            if char.ai_selector:
-                action = char.ai_selector(self, char, slot_idx, list(self.current_turn_selections))
-            elif self.manual_selector:
-                action = self.manual_selector(self, char, slot_idx, list(self.current_turn_selections))
-            else:
-                action = self._default_ai_select(char, slot_idx, list(self.current_turn_selections))
-
-            if action.skill is not None:
-                if action.consume_from_hand and action.skill in char.available_skills:
-                    char.available_skills.remove(action.skill)
-                action.skill.on_select(self, action)
-
-            self.current_turn_selections.append(action)
+        self._turn_speeds = self.compute_speed_map()
+        try:
             self.events.emit(
-                EventType.AFTER_SELECT_ACTION,
-                self,
-                action=action,
-                all_selections=self.current_turn_selections,
-            )
-
-            if action.skill:
-                tgt_names = ",".join(
-                    f"{t.name}[队友]" if (t.team == char.team and t is not char) else t.name
-                    for t in action.targets
-                )
-                if action.extra.get("intercept_target_action") is not None:
-                    i_act = action.extra["intercept_target_action"]
-                    i_sk = i_act.skill.name if i_act.skill else "?"
-                    mode_tag = f" [拦截拼点 -> {i_act.actor.name}({i_sk})]"
-                elif action.extra.get("unopposed_skip_actions"):
-                    mode_tag = " [单方面攻击(不换目标)]"
-                else:
-                    mode_tag = ""
-                self.log(
-                    f"[选技] {char.name}({self.format_hp_percent(char)}) 选择 "
-                    f"[{action.skill.name}({action.skill.format_formula()})] -> {tgt_names}{mode_tag}"
-                )
-            else:
-                self.log(f"[选技] {char.name} 无可用技能（本回合只能挨打）")
-
-        teams = self.get_teams_alive()
-        if len(teams) >= 2:
-            if self._tie_turn_starter in teams:
-                idx = teams.index(self._tie_turn_starter)
-                self._tie_turn_starter = teams[(idx + 1) % len(teams)]
-            else:
-                self._tie_turn_starter = teams[0]
-
-        planned = [
-            a for a in self.current_turn_selections
-            if not a.cancelled and a.skill is not None
-        ]
-
-        # 1) 非拼点群攻优先结算
-        non_clash_aoes = [
-            a for a in planned
-            if a.skill is not None and a.skill.is_aoe and not a.skill.clash_aoe and a.actor.alive
-        ]
-        if len(non_clash_aoes) == 1:
-            self._resolve_aoe(non_clash_aoes[0])
-            self._drain_pursuit_queue()
-        elif len(non_clash_aoes) > 1:
-            if self._need_aoe_contest(non_clash_aoes):
-                winners = self._resolve_aoe_contest(non_clash_aoes)
-            else:
-                winners = non_clash_aoes
-
-            for aoe_act in winners:
-                if self.check_victory():
-                    break
-                if aoe_act.cancelled or not aoe_act.actor.alive:
-                    continue
-                self._resolve_aoe(
-                    aoe_act,
-                    pre_rolled_aoe=aoe_act.extra.get("aoe_contest_roll"),
-                )
-                self._drain_pursuit_queue()
-
-            if winners and not self.check_victory():
-                for act in non_clash_aoes:
-                    if self.check_victory():
-                        break
-                    if (
-                        act.extra.get("aoe_contest_lost")
-                        and act.actor.alive
-                        and act.skill is not None
-                        and (act.skill.has_unbreakable() or act.extra.get("force_unbreakable"))
-                    ):
-                        u_act = self._build_unbreakable_action(winners[0], act, from_aoe=True)
-                        if u_act is not None:
-                            self._resolve_unbreakable_attack(u_act)
-                            self._drain_pursuit_queue()
-
-        # 2) 拼点群攻与其余常规技能进入拼点/单方面攻击阶段
-        remaining = [
-            a for a in planned
-            if not a.cancelled
-            and a.skill is not None
-            and not a.extra.get("aoe_resolved")
-        ]
-        self.events.emit(EventType.RESOLVE_MATCHUPS, self, actions=remaining)
-
-        clashes, unopposed = self._pair_actions(remaining)
-
-        for act1, act2 in clashes:
-            if self.check_victory():
-                break
-            self._resolve_clash(act1, act2)
-            self._drain_pursuit_queue()
-
-        for act in unopposed:
-            self.action_queue.append(act)
-        self._drain_pursuit_queue()
-
-        if not self.check_victory():
-            self.events.emit(
-                EventType.TURN_END,
+                EventType.TURN_START,
                 self,
                 round_num=self.round_num,
                 turn_in_round=self.turn_in_round,
+                global_turn=self.global_turn,
             )
-        self._drain_pursuit_queue()
-        self.bgm.evaluate(reason="回合结束")
+            self.bgm.evaluate(reason="回合开始")
+
+            if self.show_turn_board:
+                self._log_turn_board()
+
+            order = self.compute_selection_order()
+            self.current_turn_selections = []
+
+            for char, slot_idx in order:
+                if not char.alive:
+                    continue
+                pre_ctx = self.events.emit(
+                    EventType.BEFORE_SELECT_ACTION,
+                    self,
+                    character=char,
+                    slot_idx=slot_idx,
+                    previous_selections=self.current_turn_selections,
+                )
+                if pre_ctx.cancelled:
+                    continue
+
+                if char.ai_selector:
+                    action = char.ai_selector(self, char, slot_idx, list(self.current_turn_selections))
+                elif self.manual_selector:
+                    action = self.manual_selector(self, char, slot_idx, list(self.current_turn_selections))
+                else:
+                    action = self._default_ai_select(char, slot_idx, list(self.current_turn_selections))
+
+                if action.skill is not None:
+                    if action.consume_from_hand and action.skill in char.available_skills:
+                        char.available_skills.remove(action.skill)
+                    action.skill.on_select(self, action)
+
+                self.current_turn_selections.append(action)
+                self.events.emit(
+                    EventType.AFTER_SELECT_ACTION,
+                    self,
+                    action=action,
+                    all_selections=self.current_turn_selections,
+                )
+
+                if action.skill:
+                    tgt_names = ",".join(
+                        f"{t.name}[队友]" if (t.team == char.team and t is not char) else t.name
+                        for t in action.targets
+                    )
+                    if action.extra.get("intercept_target_action") is not None:
+                        i_act = action.extra["intercept_target_action"]
+                        i_sk = i_act.skill.name if i_act.skill else "?"
+                        mode_tag = f" [拦截拼点 -> {i_act.actor.name}({i_sk})]"
+                    elif action.extra.get("unopposed_skip_actions"):
+                        mode_tag = " [单方面攻击(不换目标)]"
+                    else:
+                        mode_tag = ""
+                    self.log(
+                        f"[选技] {char.name}(速度:{self.get_speed(char)}) 选择 "
+                        f"[{action.skill.name}({action.skill.format_formula()})] -> {tgt_names}{mode_tag}"
+                    )
+                else:
+                    self.log(f"[选技] {char.name}(速度:{self.get_speed(char)}) 无可用技能（本回合只能挨打）")
+
+            teams = self.get_teams_alive()
+            if len(teams) >= 2:
+                if self._tie_turn_starter in teams:
+                    idx = teams.index(self._tie_turn_starter)
+                    self._tie_turn_starter = teams[(idx + 1) % len(teams)]
+                else:
+                    self._tie_turn_starter = teams[0]
+
+            planned = [
+                a for a in self.current_turn_selections
+                if not a.cancelled and a.skill is not None
+            ]
+
+            # 1) 非拼点群攻优先结算
+            non_clash_aoes = [
+                a for a in planned
+                if a.skill is not None and a.skill.is_aoe and not a.skill.clash_aoe and a.actor.alive
+            ]
+            if len(non_clash_aoes) == 1:
+                self._resolve_aoe(non_clash_aoes[0])
+                self._drain_pursuit_queue()
+            elif len(non_clash_aoes) > 1:
+                if self._need_aoe_contest(non_clash_aoes):
+                    winners = self._resolve_aoe_contest(non_clash_aoes)
+                else:
+                    winners = non_clash_aoes
+
+                for aoe_act in winners:
+                    if self.check_victory():
+                        break
+                    if aoe_act.cancelled or not aoe_act.actor.alive:
+                        continue
+                    self._resolve_aoe(
+                        aoe_act,
+                        pre_rolled_aoe=aoe_act.extra.get("aoe_contest_roll"),
+                    )
+                    self._drain_pursuit_queue()
+
+                if winners and not self.check_victory():
+                    for act in non_clash_aoes:
+                        if self.check_victory():
+                            break
+                        if (
+                            act.extra.get("aoe_contest_lost")
+                            and act.actor.alive
+                            and act.skill is not None
+                            and (act.skill.has_unbreakable() or act.extra.get("force_unbreakable"))
+                        ):
+                            u_act = self._build_unbreakable_action(winners[0], act, from_aoe=True)
+                            if u_act is not None:
+                                self._resolve_unbreakable_attack(u_act)
+                                self._drain_pursuit_queue()
+
+            # 2) 拼点群攻与其余常规技能进入拼点/单方面攻击阶段
+            remaining = [
+                a for a in planned
+                if not a.cancelled
+                and a.skill is not None
+                and not a.extra.get("aoe_resolved")
+            ]
+            self.events.emit(EventType.RESOLVE_MATCHUPS, self, actions=remaining)
+
+            clashes, unopposed = self._pair_actions(remaining)
+
+            for act1, act2 in clashes:
+                if self.check_victory():
+                    break
+                self._resolve_clash(act1, act2)
+                self._drain_pursuit_queue()
+
+            for act in unopposed:
+                self.action_queue.append(act)
+            self._drain_pursuit_queue()
+
+            if not self.check_victory():
+                self.events.emit(
+                    EventType.TURN_END,
+                    self,
+                    round_num=self.round_num,
+                    turn_in_round=self.turn_in_round,
+                )
+            self._drain_pursuit_queue()
+            self.bgm.evaluate(reason="回合结束")
+        finally:
+            self._turn_speeds.clear()
 
     def _pair_actions(
         self, actions: List[Action]
@@ -925,7 +956,8 @@ class CombatEngine:
                 s_act.extra["original_targets"] = list(s_act.targets)
                 s_act.targets = [a1.actor]
                 self.log(
-                    f"[拦截拼点] {a1.actor.name} 拦截了 {s_act.actor.name} 的"
+                    f"[拦截拼点] {a1.actor.name}(速度:{self.get_speed(a1.actor)}) 拦截了 "
+                    f"{s_act.actor.name}(速度:{self.get_speed(s_act.actor)}) 的"
                     f"【{s_act.skill.name}】(原目标 {orig_names} -> 改为 {a1.actor.name})！"
                 )
             clashes.append((a1, s_act))
