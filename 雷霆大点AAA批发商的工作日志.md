@@ -6,3 +6,4 @@
 
 v2改了main，models，combot：打队友
 改了__init__.py 和 statuses.py加了麻痹
+加了gui.py 改了main and combot
